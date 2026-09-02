@@ -434,6 +434,8 @@ cli = [
 ]
 dev = [
     { name = "fastapi" },
+    { name = "langchain-core" },
+    { name = "langgraph" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "respx" },
@@ -449,7 +451,9 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.115.0" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
+    { name = "langchain-core", marker = "extra == 'dev'", specifier = ">=0.3.0,<2.0" },
     { name = "langchain-core", marker = "extra == 'graphs'", specifier = ">=0.3.0,<2.0" },
+    { name = "langgraph", marker = "extra == 'dev'", specifier = ">=1.2.0,<2.0" },
     { name = "langgraph", marker = "extra == 'graphs'", specifier = ">=1.2.0,<2.0" },
     { name = "pydantic", specifier = ">=2.10.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
