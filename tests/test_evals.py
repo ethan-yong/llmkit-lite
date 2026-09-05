@@ -86,7 +86,10 @@ def test_load_eval_cases_from_json_array(tmp_path) -> None:
 
 def test_load_eval_cases_from_jsonl(tmp_path) -> None:
     path = tmp_path / "cases.jsonl"
-    path.write_text('{"id":"one","input":1}\n{"id":"two","input":2}\n', encoding="utf-8")
+    path.write_text(
+        '{"id":"one","input":1}\n{"id":"two","input":2}\n',
+        encoding="utf-8",
+    )
     cases = load_eval_cases(path)
     assert [case.id for case in cases] == ["one", "two"]
 

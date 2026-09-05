@@ -36,7 +36,7 @@ class StructuredCallResult(Generic[TModel]):
         value: TModel,
         raw_content: str,
         json_text: str,
-    ) -> "StructuredCallResult[TModel]":
+    ) -> StructuredCallResult[TModel]:
         return cls(value=value, raw_content=raw_content, json_text=json_text)
 
     @classmethod
@@ -47,7 +47,7 @@ class StructuredCallResult(Generic[TModel]):
         error_code: str,
         error_detail: str,
         json_text: str | None = None,
-    ) -> "StructuredCallResult[TModel]":
+    ) -> StructuredCallResult[TModel]:
         return cls(
             value=None,
             raw_content=raw_content,

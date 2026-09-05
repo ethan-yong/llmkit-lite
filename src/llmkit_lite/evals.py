@@ -105,7 +105,11 @@ def _record_from_output(
     latency_ms: float,
     scorer: Scorer | None,
 ) -> EvalRecord:
-    score = dict(scorer(output=output, expected=case.expected, case=case)) if scorer else None
+    score = (
+        dict(scorer(output=output, expected=case.expected, case=case))
+        if scorer
+        else None
+    )
     ok = bool(score.get("ok", True)) if score is not None else True
     error_code = None
     error_detail = None

@@ -64,14 +64,12 @@ async def test_http_client_lifespan_sets_and_closes_client() -> None:
     async def client_status():
         return {"closed": app.state.http_client.closed}
 
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # ASGITransport does not drive lifespan itself; call the lifespan directly
-        # for a focused unit test of the helper.
-        lifespan = http_client_lifespan(client_factory=DummyClient)
-        async with lifespan(app):
-            assert app.state.http_client.closed is False
-        assert app.state.http_client.closed is True
+    # ASGITransport does not drive lifespan itself; call the lifespan directly
+    # for a focused unit test of the helper.
+    lifespan = http_client_lifespan(client_factory=DummyClient)
+    async with lifespan(app):
+        assert app.state.http_client.closed is False
+    assert app.state.http_client.closed is True
 
 
 async def test_llm_exception_handler_maps_errors() -> None:

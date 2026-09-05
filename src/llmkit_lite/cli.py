@@ -72,7 +72,9 @@ async def _list_models(cfg: LlmEndpointConfig) -> list[str]:
     async with httpx.AsyncClient() as client:
         for base in roots:
             try:
-                response = await client.get(f"{base}/models", headers=headers, timeout=10)
+                response = await client.get(
+                    f"{base}/models", headers=headers, timeout=10
+                )
             except httpx.HTTPError:
                 continue
             if response.status_code != 200:
@@ -104,7 +106,10 @@ async def _inspect_chat(cfg: LlmEndpointConfig) -> str:
 def inspect_llm(
     dotenv: Annotated[
         Path | None,
-        typer.Option("--dotenv", help="Optional .env file to load before resolving config."),
+        typer.Option(
+            "--dotenv",
+            help="Optional .env file to load before resolving config.",
+        ),
     ] = Path(".env"),
     provider: Annotated[str | None, typer.Option("--provider")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
@@ -212,7 +217,12 @@ def eval_cases(
     asyncio.run(run())
 
 
-def _exact_scorer(*, output: Any, expected: Any | None, case: EvalCase) -> dict[str, Any]:
+def _exact_scorer(
+    *,
+    output: Any,
+    expected: Any | None,
+    case: EvalCase,
+) -> dict[str, Any]:
     del case
     if expected is None:
         return {"ok": True}
