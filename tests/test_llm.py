@@ -2,6 +2,8 @@ import json
 
 import httpx
 import pytest
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from llmkit_lite.llm import (
     LlmEndpointConfig,
@@ -154,7 +156,60 @@ async def test_call_chat_completion_success() -> None:
     assert content == '{"ok": true}'
 
 
-async def test_call_chat_completion_retries_without_response_format_on_400() -> None:
+async def test_call_chat_completion_creates_safe_client_span(
+    in_memory_tracing,
+) -> None:
+    captured_headers: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.update(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "model": "returned-model",
+                "choices": [{"message": {"content": "private response"}}],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        tracer = trace.get_tracer("test")
+        with tracer.start_as_current_span("parent"):
+            content = await call_chat_completion(
+                [{"role": "user", "content": "private prompt"}],
+                cfg=_cfg(api_key="private-api-key"),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    spans = in_memory_tracing.get_finished_spans()
+    parent_span = next(span for span in spans if span.name == "parent")
+    llm_span = next(span for span in spans if span.name == "llm.chat_completion")
+    assert content == "private response"
+    assert captured_headers["traceparent"].startswith("00-")
+    assert llm_span.kind.name == "CLIENT"
+    assert llm_span.parent.span_id == parent_span.context.span_id
+    assert llm_span.attributes["gen_ai.provider.name"] == "local"
+    assert llm_span.attributes["gen_ai.request.model"] == "test-model"
+    assert llm_span.attributes["gen_ai.response.model"] == "returned-model"
+    assert llm_span.attributes["http.response.status_code"] == 200
+    assert llm_span.attributes["gen_ai.usage.input_tokens"] == 7
+    assert llm_span.attributes["gen_ai.usage.output_tokens"] == 3
+    assert llm_span.attributes["llmkit.usage.total_tokens"] == 10
+    exported = str(llm_span.attributes) + str(llm_span.events)
+    assert "private prompt" not in exported
+    assert "private response" not in exported
+    assert "private-api-key" not in exported
+
+
+async def test_call_chat_completion_retries_without_response_format_on_400(
+    in_memory_tracing,
+) -> None:
     calls: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -175,9 +230,17 @@ async def test_call_chat_completion_retries_without_response_format_on_400() -> 
     assert content == '{"ok": true}'
     assert len(calls) == 2
     assert "response_format" not in calls[1]
+    llm_span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.chat_completion"
+    )
+    assert [event.name for event in llm_span.events] == [
+        "llm.response_format_retry"
+    ]
 
 
-async def test_call_chat_completion_timeout_raises() -> None:
+async def test_call_chat_completion_timeout_raises(in_memory_tracing) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timed out", request=request)
 
@@ -191,9 +254,42 @@ async def test_call_chat_completion_timeout_raises() -> None:
                 timeout_seconds=5,
             )
     assert exc_info.value.code == "llm_timeout"
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.chat_completion"
+    )
+    assert span.attributes["error.type"] == "llm_timeout"
+    assert span.status.status_code is StatusCode.ERROR
 
 
-async def test_call_chat_completion_non_2xx_raises() -> None:
+async def test_call_chat_completion_transport_failure_is_traced(
+    in_memory_tracing,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unreachable", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion(
+                [{"role": "user", "content": "hi"}],
+                cfg=_cfg(),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.chat_completion"
+    )
+    assert exc_info.value.code == "llm_fetch_failed"
+    assert span.attributes["error.type"] == "llm_fetch_failed"
+    assert span.status.status_code is StatusCode.ERROR
+
+
+async def test_call_chat_completion_non_2xx_raises(in_memory_tracing) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="upstream broke")
 
@@ -208,9 +304,18 @@ async def test_call_chat_completion_non_2xx_raises() -> None:
             )
     assert exc_info.value.code == "llm_http_500"
     assert exc_info.value.raw == "upstream broke"
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.chat_completion"
+    )
+    assert span.attributes["error.type"] == "llm_http_500"
+    assert span.status.status_code is StatusCode.ERROR
 
 
-async def test_call_chat_completion_invalid_response_shape_raises() -> None:
+async def test_call_chat_completion_invalid_response_shape_raises(
+    in_memory_tracing,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"unexpected": "shape"})
 
@@ -224,3 +329,10 @@ async def test_call_chat_completion_invalid_response_shape_raises() -> None:
                 timeout_seconds=5,
             )
     assert exc_info.value.code == "llm_invalid_response_json"
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.chat_completion"
+    )
+    assert span.attributes["error.type"] == "llm_invalid_response_json"
+    assert span.status.status_code is StatusCode.ERROR

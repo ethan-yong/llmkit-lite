@@ -4,6 +4,8 @@ import logging
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+from opentelemetry.trace import StatusCode
 
 from llmkit_lite.api import (
     RequestIdFilter,
@@ -14,6 +16,15 @@ from llmkit_lite.api import (
     llm_exception_handler,
 )
 from llmkit_lite.llm import LlmGatewayError
+from llmkit_lite.observability import (
+    execution_context,
+    get_thread_id,
+    get_trace_id,
+    trace_span,
+)
+from llmkit_lite.observability import (
+    get_request_id as get_observability_request_id,
+)
 
 
 async def test_request_id_middleware_uses_header_and_isolates_concurrent_requests():
@@ -23,7 +34,10 @@ async def test_request_id_middleware_uses_header_and_isolates_concurrent_request
     @app.get("/id")
     async def read_id():
         await asyncio.sleep(0.01)
-        return {"request_id": get_request_id()}
+        return {
+            "request_id": get_request_id(),
+            "observability_request_id": get_observability_request_id(),
+        }
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -32,11 +46,18 @@ async def test_request_id_middleware_uses_header_and_isolates_concurrent_request
             client.get("/id", headers={"X-Request-ID": "req-b"}),
         )
 
-    assert first.json() == {"request_id": "req-a"}
-    assert second.json() == {"request_id": "req-b"}
+    assert first.json() == {
+        "request_id": "req-a",
+        "observability_request_id": "req-a",
+    }
+    assert second.json() == {
+        "request_id": "req-b",
+        "observability_request_id": "req-b",
+    }
     assert first.headers["X-Request-ID"] == "req-a"
     assert second.headers["X-Request-ID"] == "req-b"
     assert get_request_id() == "-"
+    assert get_observability_request_id() == "-"
 
 
 def test_configure_logging_adds_request_id_filter() -> None:
@@ -48,6 +69,84 @@ def test_configure_logging_adds_request_id_filter() -> None:
         assert any(isinstance(f, RequestIdFilter) for f in handler.filters)
     finally:
         root.removeHandler(handler)
+
+
+def test_request_id_filter_adds_execution_and_trace_context(
+    in_memory_tracing,
+) -> None:
+    record = logging.LogRecord("test", logging.INFO, "", 0, "message", (), None)
+
+    with execution_context("request-1", "thread-1"):
+        with trace_span("operation"):
+            RequestIdFilter().filter(record)
+
+    assert record.request_id == "request-1"
+    assert record.thread_id == "thread-1"
+    assert len(record.trace_id) == 32
+
+
+async def test_request_middleware_creates_server_span_from_inbound_context(
+    in_memory_tracing,
+) -> None:
+    app = FastAPI()
+    add_request_id_middleware(app)
+
+    @app.get("/items/{item_id}")
+    async def read_item(item_id: str):
+        return {
+            "item_id": item_id,
+            "thread_id": get_thread_id(),
+            "trace_id": get_trace_id(),
+        }
+
+    parent_trace_id = "00000000000000000000000000000011"
+    parent_span_id = "0000000000000022"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/items/secret-item-id",
+            headers={
+                "X-Request-ID": "request-1",
+                "X-Thread-ID": "thread-1",
+                "traceparent": f"00-{parent_trace_id}-{parent_span_id}-01",
+            },
+        )
+
+    spans = in_memory_tracing.get_finished_spans()
+    server_span = next(span for span in spans if span.name == "GET /items/{item_id}")
+    assert response.json() == {
+        "item_id": "secret-item-id",
+        "thread_id": "thread-1",
+        "trace_id": parent_trace_id,
+    }
+    assert server_span.kind.name == "SERVER"
+    assert server_span.context.trace_id == int(parent_trace_id, 16)
+    assert server_span.parent.span_id == int(parent_span_id, 16)
+    assert server_span.attributes["http.request.method"] == "GET"
+    assert server_span.attributes["http.route"] == "/items/{item_id}"
+    assert server_span.attributes["http.response.status_code"] == 200
+    assert "secret-item-id" not in str(server_span.attributes)
+
+
+async def test_request_middleware_marks_server_errors(in_memory_tracing) -> None:
+    app = FastAPI()
+    add_request_id_middleware(app)
+
+    @app.get("/unavailable")
+    async def unavailable():
+        return PlainTextResponse("unavailable", status_code=503)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/unavailable")
+
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "GET /unavailable"
+    )
+    assert response.status_code == 503
+    assert span.status.status_code is StatusCode.ERROR
 
 
 async def test_http_client_lifespan_sets_and_closes_client() -> None:
