@@ -14,6 +14,7 @@ from llmkit_lite.api import (
     llm_exception_handler,
 )
 from llmkit_lite.llm import LlmGatewayError
+from llmkit_lite.observability import get_request_id as get_observability_request_id
 
 
 async def test_request_id_middleware_uses_header_and_isolates_concurrent_requests():
@@ -23,7 +24,10 @@ async def test_request_id_middleware_uses_header_and_isolates_concurrent_request
     @app.get("/id")
     async def read_id():
         await asyncio.sleep(0.01)
-        return {"request_id": get_request_id()}
+        return {
+            "request_id": get_request_id(),
+            "observability_request_id": get_observability_request_id(),
+        }
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -32,11 +36,18 @@ async def test_request_id_middleware_uses_header_and_isolates_concurrent_request
             client.get("/id", headers={"X-Request-ID": "req-b"}),
         )
 
-    assert first.json() == {"request_id": "req-a"}
-    assert second.json() == {"request_id": "req-b"}
+    assert first.json() == {
+        "request_id": "req-a",
+        "observability_request_id": "req-a",
+    }
+    assert second.json() == {
+        "request_id": "req-b",
+        "observability_request_id": "req-b",
+    }
     assert first.headers["X-Request-ID"] == "req-a"
     assert second.headers["X-Request-ID"] == "req-b"
     assert get_request_id() == "-"
+    assert get_observability_request_id() == "-"
 
 
 def test_configure_logging_adds_request_id_filter() -> None:

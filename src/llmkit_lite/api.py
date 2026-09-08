@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextvars
 import logging
 import os
 import uuid
@@ -13,10 +12,8 @@ from typing import Any
 import httpx
 
 from llmkit_lite.llm import LlmGatewayError
-
-_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "llmkit_request_id", default="-"
-)
+from llmkit_lite.observability import execution_context
+from llmkit_lite.observability import get_request_id as _get_request_id
 
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s"
 
@@ -30,7 +27,9 @@ class RequestIdFilter(logging.Filter):
 
 
 def get_request_id() -> str:
-    return _request_id.get()
+    """Return the request identifier bound to the current execution."""
+
+    return _get_request_id()
 
 
 def configure_logging(
@@ -70,14 +69,14 @@ def add_request_id_middleware(
     @app.middleware("http")
     async def _assign_request_id(request: Request, call_next: Callable[..., Awaitable]):
         incoming = request.headers.get(header_name)
-        token = _request_id.set(incoming.strip() if incoming else make_id())
-        try:
+        request_id = incoming.strip() if incoming else ""
+        if not request_id:
+            request_id = make_id()
+        with execution_context(request_id=request_id):
             response = await call_next(request)
             if response_header:
                 response.headers[header_name] = get_request_id()
             return response
-        finally:
-            _request_id.reset(token)
 
 
 def http_client_lifespan(
