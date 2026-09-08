@@ -20,7 +20,9 @@ def _chat_content(text: str) -> str:
     )
 
 
-async def test_fastapi_tracing_gateway_and_structured_output_compose() -> None:
+async def test_fastapi_tracing_gateway_and_structured_output_compose(
+    in_memory_tracing,
+) -> None:
     def llm_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["messages"][0]["content"] == "Classify: hello"
@@ -69,3 +71,8 @@ async def test_fastapi_tracing_gateway_and_structured_output_compose() -> None:
         "label": "greeting",
         "confidence": 0.97,
     }
+    spans = in_memory_tracing.get_finished_spans()
+    request_span = next(span for span in spans if span.name == "GET /classify")
+    llm_span = next(span for span in spans if span.name == "llm.chat_completion")
+    assert llm_span.context.trace_id == request_span.context.trace_id
+    assert llm_span.parent.span_id == request_span.context.span_id

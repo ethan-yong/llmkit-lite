@@ -25,6 +25,7 @@ Optional feature groups:
 uv add "llmkit-lite[api]"
 uv add "llmkit-lite[graphs]"
 uv add "llmkit-lite[cli]"
+uv add "llmkit-lite[observability]"
 ```
 
 ## Configuration
@@ -109,6 +110,39 @@ app = FastAPI(lifespan=http_client_lifespan())
 add_request_id_middleware(app)
 app.add_exception_handler(LlmGatewayError, llm_exception_handler())
 ```
+
+Requests accept `X-Request-ID` and optional `X-Thread-ID` headers. The middleware
+keeps those identifiers isolated across concurrent requests and creates a server
+span when tracing is enabled.
+
+## Observability
+
+Tracing is disabled by default. Enable OTLP/HTTP export during application
+startup:
+
+```python
+from llmkit_lite.observability import TracingSettings, configure_tracing
+
+
+configure_tracing(
+    TracingSettings(
+        enabled=True,
+        service_name="support-agent",
+        service_version="1.0.0",
+        environment="production",
+    )
+)
+```
+
+Set the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to your
+collector URL, or pass `otlp_endpoint` explicitly. FastAPI requests and LLM
+gateway calls produce correlated spans, and active request, thread, and trace
+IDs are added to configured log records. Trace context is extracted from
+incoming requests and propagated to the LLM gateway.
+
+The built-in instrumentation records operational metadata such as provider,
+model, HTTP status, latency, and token counts. It does not record prompts,
+responses, authorization headers, API keys, or tool arguments.
 
 ## LangGraph Helpers
 

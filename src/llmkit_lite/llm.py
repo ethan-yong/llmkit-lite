@@ -11,6 +11,12 @@ from typing import Any, Literal
 
 import httpx
 
+from llmkit_lite.observability import (
+    inject_trace_context,
+    set_span_error,
+    trace_span,
+)
+
 logger = logging.getLogger("llmkit_lite.llm")
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
@@ -197,59 +203,113 @@ async def call_chat_completion(
             extra_body=extra_body,
         )
 
-    start = time.perf_counter()
-    try:
-        resp = await http_client.post(
-            url,
-            headers=auth_headers(cfg),
-            json=_body(True),
-            timeout=timeout_seconds,
-        )
-        if resp.status_code == 400 and use_response_format:
+    attributes: dict[str, str | int | float] = {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": cfg.provider,
+        "gen_ai.request.model": cfg.model_name,
+        "llmkit.timeout_seconds": timeout_seconds,
+    }
+    with trace_span(
+        "llm.chat_completion",
+        kind="client",
+        attributes=attributes,
+    ) as span:
+        headers = auth_headers(cfg)
+        inject_trace_context(headers)
+        start = time.perf_counter()
+        try:
             resp = await http_client.post(
                 url,
-                headers=auth_headers(cfg),
-                json=_body(False),
+                headers=headers,
+                json=_body(True),
                 timeout=timeout_seconds,
             )
-    except httpx.TimeoutException as exc:
-        elapsed = time.perf_counter() - start
-        logger.error("LLM gateway timed out after %.2fs", elapsed)
-        raise LlmGatewayError("llm_timeout", str(exc)) from exc
-    except httpx.HTTPError as exc:
-        elapsed = time.perf_counter() - start
-        logger.error("LLM gateway request failed after %.2fs: %s", elapsed, exc)
-        raise LlmGatewayError("llm_fetch_failed", str(exc)) from exc
+            if resp.status_code == 400 and use_response_format:
+                if span is not None:
+                    span.add_event(
+                        "llm.response_format_retry",
+                        {"http.response.status_code": 400},
+                    )
+                resp = await http_client.post(
+                    url,
+                    headers=headers,
+                    json=_body(False),
+                    timeout=timeout_seconds,
+                )
+        except httpx.TimeoutException as exc:
+            elapsed = time.perf_counter() - start
+            logger.error("LLM gateway timed out after %.2fs", elapsed)
+            if span is not None:
+                span.set_attribute("error.type", "llm_timeout")
+                set_span_error(span, "llm_timeout")
+            raise LlmGatewayError("llm_timeout", str(exc)) from exc
+        except httpx.HTTPError as exc:
+            elapsed = time.perf_counter() - start
+            logger.error("LLM gateway request failed after %.2fs: %s", elapsed, exc)
+            if span is not None:
+                span.set_attribute("error.type", "llm_fetch_failed")
+                set_span_error(span, "llm_fetch_failed")
+            raise LlmGatewayError("llm_fetch_failed", str(exc)) from exc
 
-    elapsed = time.perf_counter() - start
-    if resp.status_code < 200 or resp.status_code >= 300:
-        body_text = resp.text[:500]
-        logger.error(
-            "LLM gateway returned HTTP %d after %.2fs: %s",
-            resp.status_code,
+        elapsed = time.perf_counter() - start
+        if span is not None:
+            span.set_attribute("http.response.status_code", resp.status_code)
+        if resp.status_code < 200 or resp.status_code >= 300:
+            body_text = resp.text[:500]
+            error_code = f"llm_http_{resp.status_code}"
+            logger.error(
+                "LLM gateway returned HTTP %d after %.2fs: %s",
+                resp.status_code,
+                elapsed,
+                body_text,
+            )
+            if span is not None:
+                span.set_attribute("error.type", error_code)
+                set_span_error(span, error_code)
+            raise LlmGatewayError(error_code, "non-2xx from LLM gateway", body_text)
+
+        try:
+            payload = resp.json()
+            content = payload["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            logger.error("LLM gateway returned an unexpected response shape: %s", exc)
+            if span is not None:
+                span.set_attribute("error.type", "llm_invalid_response_json")
+                set_span_error(span, "llm_invalid_response_json")
+            raise LlmGatewayError("llm_invalid_response_json", str(exc)) from exc
+
+        if not isinstance(content, str):
+            if span is not None:
+                span.set_attribute("error.type", "llm_invalid_response_json")
+                set_span_error(span, "llm_invalid_response_json")
+            raise LlmGatewayError(
+                "llm_invalid_response_json", "message content was not a string"
+            )
+
+        returned_model = payload.get("model", cfg.model_name)
+        if span is not None:
+            if isinstance(returned_model, str):
+                span.set_attribute("gen_ai.response.model", returned_model)
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                _record_usage_attributes(span, usage)
+
+        logger.info(
+            "LLM gateway call ok in %.2fs (provider=%s model=%s)",
             elapsed,
-            body_text,
+            cfg.provider,
+            returned_model,
         )
-        raise LlmGatewayError(
-            f"llm_http_{resp.status_code}", "non-2xx from LLM gateway", body_text
-        )
+        return content
 
-    try:
-        payload = resp.json()
-        content = payload["choices"][0]["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        logger.error("LLM gateway returned an unexpected response shape: %s", exc)
-        raise LlmGatewayError("llm_invalid_response_json", str(exc)) from exc
 
-    if not isinstance(content, str):
-        raise LlmGatewayError(
-            "llm_invalid_response_json", "message content was not a string"
-        )
-
-    logger.info(
-        "LLM gateway call ok in %.2fs (provider=%s model=%s)",
-        elapsed,
-        cfg.provider,
-        payload.get("model", cfg.model_name),
-    )
-    return content
+def _record_usage_attributes(span: Any, usage: Mapping[str, Any]) -> None:
+    attribute_by_usage_key = {
+        "prompt_tokens": "gen_ai.usage.input_tokens",
+        "completion_tokens": "gen_ai.usage.output_tokens",
+        "total_tokens": "llmkit.usage.total_tokens",
+    }
+    for usage_key, attribute_name in attribute_by_usage_key.items():
+        value = usage.get(usage_key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            span.set_attribute(attribute_name, value)

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import contextvars
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.trace import Span
 
 
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -117,6 +118,72 @@ def get_execution_context() -> ExecutionContext:
         thread_id=get_thread_id(),
         trace_id=get_trace_id(),
     )
+
+
+@contextmanager
+def trace_span(
+    name: str,
+    *,
+    kind: Literal["internal", "server", "client"] = "internal",
+    attributes: Mapping[str, Any] | None = None,
+    carrier: Mapping[str, str] | None = None,
+) -> Iterator[Span | None]:
+    """Start an optional span without requiring the observability extra."""
+
+    normalized_name = _normalize_required_identifier(name, "span name")
+    try:
+        from opentelemetry import propagate, trace
+        from opentelemetry.trace import SpanKind, StatusCode
+    except ImportError:
+        yield None
+        return
+
+    span_kinds = {
+        "internal": SpanKind.INTERNAL,
+        "server": SpanKind.SERVER,
+        "client": SpanKind.CLIENT,
+    }
+    if kind not in span_kinds:
+        raise ValueError(f"unsupported span kind: {kind!r}")
+    parent_context = propagate.extract(carrier) if carrier is not None else None
+    with trace.get_tracer("llmkit_lite").start_as_current_span(
+        normalized_name,
+        context=parent_context,
+        kind=span_kinds[kind],
+        attributes=dict(attributes or {}),
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            yield span
+        except BaseException as exc:
+            error_type = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            span.set_attribute("exception.type", error_type)
+            if span.is_recording() and span.status.status_code is not StatusCode.ERROR:
+                set_span_error(span, error_type)
+            raise
+
+
+def inject_trace_context(carrier: MutableMapping[str, str]) -> None:
+    """Inject the active W3C trace context into a mutable carrier."""
+
+    try:
+        from opentelemetry import propagate
+    except ImportError:
+        return
+    propagate.inject(carrier)
+
+
+def set_span_error(span: Span | None, description: str) -> None:
+    """Mark a recording span as failed without importing the SDK."""
+
+    if span is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+    except ImportError:
+        return
+    span.set_status(Status(StatusCode.ERROR, description))
 
 
 @contextmanager

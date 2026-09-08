@@ -3,6 +3,9 @@ import builtins
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, use_span
 
 from llmkit_lite.observability import (
@@ -14,6 +17,9 @@ from llmkit_lite.observability import (
     get_request_id,
     get_thread_id,
     get_trace_id,
+    inject_trace_context,
+    set_span_error,
+    trace_span,
 )
 
 
@@ -102,6 +108,49 @@ def test_get_trace_id_formats_active_valid_span_context() -> None:
     assert get_trace_id() is None
 
 
+def test_trace_span_extracts_and_injects_w3c_context(in_memory_tracing) -> None:
+    parent_trace_id = "00000000000000000000000000000011"
+    parent_span_id = "0000000000000022"
+    outbound: dict[str, str] = {}
+
+    with trace_span(
+        "server operation",
+        kind="server",
+        carrier={
+            "traceparent": f"00-{parent_trace_id}-{parent_span_id}-01",
+        },
+    ) as span:
+        assert span is not None
+        inject_trace_context(outbound)
+
+    exported = in_memory_tracing.get_finished_spans()[0]
+    assert exported.context.trace_id == int(parent_trace_id, 16)
+    assert exported.parent.span_id == int(parent_span_id, 16)
+    assert outbound["traceparent"].startswith(f"00-{parent_trace_id}-")
+
+
+def test_set_span_error_marks_recording_span(in_memory_tracing) -> None:
+    with trace_span("failed operation") as span:
+        set_span_error(span, "failed")
+
+    exported = in_memory_tracing.get_finished_spans()[0]
+    assert exported.status.status_code.name == "ERROR"
+    assert exported.status.description == "failed"
+
+
+def test_trace_span_records_only_safe_exception_type(in_memory_tracing) -> None:
+    with pytest.raises(RuntimeError, match="private exception detail"):
+        with trace_span("failed operation"):
+            raise RuntimeError("private exception detail")
+
+    exported = in_memory_tracing.get_finished_spans()[0]
+    assert exported.attributes["exception.type"] == "builtins.RuntimeError"
+    assert exported.status.status_code.name == "ERROR"
+    assert exported.status.description == "builtins.RuntimeError"
+    assert exported.events == ()
+    assert "private exception detail" not in str(exported.attributes)
+
+
 def test_disabled_tracing_does_not_import_opentelemetry_sdk(monkeypatch) -> None:
     real_import = builtins.__import__
 
@@ -116,17 +165,20 @@ def test_disabled_tracing_does_not_import_opentelemetry_sdk(monkeypatch) -> None
 
 
 def test_enabled_tracing_is_idempotent_and_rejects_conflicts(monkeypatch) -> None:
-    exported: list[object] = []
+    exporters: list[InMemorySpanExporter] = []
 
-    def record_export(self, spans):
-        exported.extend(spans)
-        from opentelemetry.sdk.trace.export import SpanExportResult
+    class InMemoryOTLPSpanExporter(InMemorySpanExporter):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.options = kwargs
+            exporters.append(self)
 
-        return SpanExportResult.SUCCESS
+    import opentelemetry.exporter.otlp.proto.http.trace_exporter as trace_exporter
 
     monkeypatch.setattr(
-        "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter.export",
-        record_export,
+        trace_exporter,
+        "OTLPSpanExporter",
+        InMemoryOTLPSpanExporter,
     )
     settings = TracingSettings(
         enabled=True,
@@ -151,7 +203,8 @@ def test_enabled_tracing_is_idempotent_and_rejects_conflicts(monkeypatch) -> Non
     with tracer.start_as_current_span("operation"):
         assert get_trace_id() is not None
     assert provider.force_flush()
-    assert len(exported) == 1
+    assert exporters[0].options == {"endpoint": "http://collector.test/v1/traces"}
+    assert len(exporters[0].get_finished_spans()) == 1
 
 
 def test_enabled_tracing_requires_observability_extra(monkeypatch) -> None:

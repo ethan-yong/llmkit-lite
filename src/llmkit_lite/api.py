@@ -12,17 +12,29 @@ from typing import Any
 import httpx
 
 from llmkit_lite.llm import LlmGatewayError
-from llmkit_lite.observability import execution_context
+from llmkit_lite.observability import (
+    execution_context,
+    get_thread_id,
+    get_trace_id,
+    set_span_error,
+    trace_span,
+)
 from llmkit_lite.observability import get_request_id as _get_request_id
 
-DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s"
+DEFAULT_LOG_FORMAT = (
+    "%(asctime)s %(levelname)s "
+    "[request_id=%(request_id)s thread_id=%(thread_id)s trace_id=%(trace_id)s] "
+    "%(name)s: %(message)s"
+)
 
 
 class RequestIdFilter(logging.Filter):
-    """Attach the active request ID to every log record."""
+    """Attach active execution identifiers to every log record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = get_request_id()
+        record.thread_id = get_thread_id() or "-"
+        record.trace_id = get_trace_id() or "-"
         return True
 
 
@@ -54,10 +66,11 @@ def add_request_id_middleware(
     app: Any,
     *,
     header_name: str = "X-Request-ID",
+    thread_header_name: str = "X-Thread-ID",
     response_header: bool = True,
     id_factory: Callable[[], str] | None = None,
 ) -> None:
-    """Install middleware that scopes a request ID via `contextvars`."""
+    """Install middleware that scopes request context and creates a server span."""
 
     try:
         from fastapi import Request
@@ -72,11 +85,49 @@ def add_request_id_middleware(
         request_id = incoming.strip() if incoming else ""
         if not request_id:
             request_id = make_id()
-        with execution_context(request_id=request_id):
-            response = await call_next(request)
-            if response_header:
-                response.headers[header_name] = get_request_id()
-            return response
+        incoming_thread = request.headers.get(thread_header_name)
+        thread_id = incoming_thread.strip() if incoming_thread else None
+        if not thread_id:
+            thread_id = None
+
+        attributes: dict[str, str | int] = {
+            "http.request.method": request.method,
+            "url.scheme": request.url.scheme,
+            "llmkit.request_id": request_id,
+        }
+        if request.url.hostname:
+            attributes["server.address"] = request.url.hostname
+        if request.url.port:
+            attributes["server.port"] = request.url.port
+        if thread_id is not None:
+            attributes["llmkit.thread_id"] = thread_id
+
+        with execution_context(request_id=request_id, thread_id=thread_id):
+            with trace_span(
+                f"HTTP {request.method}",
+                kind="server",
+                attributes=attributes,
+                carrier=request.headers,
+            ) as span:
+                response = None
+                try:
+                    response = await call_next(request)
+                finally:
+                    route = request.scope.get("route")
+                    route_path = getattr(route, "path", None)
+                    if span is not None:
+                        if isinstance(route_path, str):
+                            span.update_name(f"{request.method} {route_path}")
+                            span.set_attribute("http.route", route_path)
+                        if response is not None:
+                            span.set_attribute(
+                                "http.response.status_code", response.status_code
+                            )
+                            if response.status_code >= 500:
+                                set_span_error(span, f"HTTP {response.status_code}")
+                if response_header:
+                    response.headers[header_name] = get_request_id()
+                return response
 
 
 def http_client_lifespan(
