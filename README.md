@@ -65,6 +65,84 @@ async def summarize(text: str) -> str:
         )
 ```
 
+## Resilient Provider Routing
+
+Use `LlmRouter` when an application needs to select between providers, retry
+failed calls, and fall back when a provider remains unavailable. The original
+`call_chat_completion()` helper stays one-shot so existing applications do not
+silently gain extra latency or provider cost.
+
+This example normally uses local vLLM, explicitly routes requests that prefer
+DeepSeek, and gives each primary route one ordered fallback:
+
+```python
+import os
+
+import httpx
+
+from llmkit_lite.llm import ChatCompletionRequest, LlmEndpointConfig
+from llmkit_lite.routing import (
+    LlmResiliencePolicy,
+    LlmRoute,
+    LlmRouter,
+    LlmRouteRule,
+)
+
+
+local = LlmEndpointConfig(
+    provider="vllm",
+    base_url=os.environ["VLLM_BASE_URL"],
+    model_name=os.environ["VLLM_MODEL_NAME"],
+    api_key=os.getenv("VLLM_API_KEY"),
+)
+deepseek = LlmEndpointConfig(
+    provider="deepseek",
+    base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+    model_name=os.environ["DEEPSEEK_MODEL_NAME"],
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+)
+
+router = LlmRouter(
+    routes=(
+        LlmRoute("local", local, fallback_routes=("deepseek",)),
+        LlmRoute("deepseek", deepseek, fallback_routes=("local",)),
+    ),
+    default_route="local",
+    resilience_policy=LlmResiliencePolicy(),
+    rules=(
+        LlmRouteRule(
+            name="prefer DeepSeek",
+            route_name="deepseek",
+            predicate=lambda request: (
+                request.routing_metadata.get("provider_preference") == "deepseek"
+            ),
+        ),
+    ),
+)
+
+
+async def complete(messages: list[dict[str, str]]) -> str:
+    request = ChatCompletionRequest(
+        messages=messages,
+        max_tokens=300,
+        timeout_seconds=20,
+        routing_metadata={"provider_preference": "local"},
+    )
+    async with httpx.AsyncClient() as client:
+        return await router.complete(request, http_client=client)
+```
+
+The default resilience policy tries each eligible route twice, with exponential
+backoff and jitter. A route's circuit opens after three consecutive calls exhaust
+their retries. After 30 seconds, one request is allowed to probe the route; a
+successful probe closes the circuit.
+
+All `LlmGatewayError` values trigger retries and fallback, including HTTP 4xx and
+malformed provider responses. This can increase latency and cost, and a timeout
+can cause a provider to process a duplicate request. Configure fewer attempts
+with `LlmResiliencePolicy` when those tradeoffs are unsuitable. Routing metadata
+is available to predicates but is not sent to providers or recorded in telemetry.
+
 ## Structured Outputs
 
 ```python
