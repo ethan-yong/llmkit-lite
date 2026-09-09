@@ -6,8 +6,9 @@ import logging
 import os
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Literal, Protocol
 
 import httpx
 
@@ -48,6 +49,50 @@ class LlmEndpointConfig:
     model_name: str
     api_key: str | None = None
     reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ChatCompletionRequest:
+    """Provider-independent inputs for one chat completion."""
+
+    messages: Sequence[ChatMessage]
+    max_tokens: int
+    timeout_seconds: float
+    temperature: float = 0
+    use_response_format: bool = True
+    extra_body: Mapping[str, Any] | None = None
+    routing_metadata: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "messages",
+            tuple(MappingProxyType(dict(message)) for message in self.messages),
+        )
+        if self.extra_body is not None:
+            object.__setattr__(
+                self,
+                "extra_body",
+                MappingProxyType(dict(self.extra_body)),
+            )
+        object.__setattr__(
+            self,
+            "routing_metadata",
+            MappingProxyType(dict(self.routing_metadata)),
+        )
+
+
+class LlmProviderAdapter(Protocol):
+    """Transport boundary implemented by an LLM provider adapter."""
+
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        cfg: LlmEndpointConfig,
+        http_client: httpx.AsyncClient,
+    ) -> str:
+        """Execute one chat-completion request and return its text content."""
 
 
 def _env_get(env: Mapping[str, str], key: str) -> str:
@@ -169,6 +214,148 @@ def chat_completion_body(
     return body
 
 
+class OpenAICompatibleAdapter:
+    """Adapter for OpenAI-compatible chat completion APIs."""
+
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        cfg: LlmEndpointConfig,
+        http_client: httpx.AsyncClient,
+    ) -> str:
+        """Call an endpoint and return message content.
+
+        A single retry without `response_format` is attempted after HTTP 400
+        because several compatible gateways reject that parameter even when
+        they can still produce JSON.
+        """
+
+        url = chat_completions_url(cfg.base_url)
+
+        def _body(with_response_format: bool) -> dict[str, Any]:
+            return chat_completion_body(
+                request.messages,
+                cfg=cfg,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                response_format=(
+                    {"type": "json_object"}
+                    if with_response_format and request.use_response_format
+                    else None
+                ),
+                extra_body=request.extra_body,
+            )
+
+        attributes: dict[str, str | int | float] = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": cfg.provider,
+            "gen_ai.request.model": cfg.model_name,
+            "llmkit.timeout_seconds": request.timeout_seconds,
+        }
+        with trace_span(
+            "llm.chat_completion",
+            kind="client",
+            attributes=attributes,
+        ) as span:
+            headers = auth_headers(cfg)
+            inject_trace_context(headers)
+            start = time.perf_counter()
+            try:
+                resp = await http_client.post(
+                    url,
+                    headers=headers,
+                    json=_body(True),
+                    timeout=request.timeout_seconds,
+                )
+                if resp.status_code == 400 and request.use_response_format:
+                    if span is not None:
+                        span.add_event(
+                            "llm.response_format_retry",
+                            {"http.response.status_code": 400},
+                        )
+                    resp = await http_client.post(
+                        url,
+                        headers=headers,
+                        json=_body(False),
+                        timeout=request.timeout_seconds,
+                    )
+            except httpx.TimeoutException as exc:
+                elapsed = time.perf_counter() - start
+                logger.error("LLM gateway timed out after %.2fs", elapsed)
+                if span is not None:
+                    span.set_attribute("error.type", "llm_timeout")
+                    set_span_error(span, "llm_timeout")
+                raise LlmGatewayError("llm_timeout", str(exc)) from exc
+            except httpx.HTTPError as exc:
+                elapsed = time.perf_counter() - start
+                logger.error(
+                    "LLM gateway request failed after %.2fs: %s", elapsed, exc
+                )
+                if span is not None:
+                    span.set_attribute("error.type", "llm_fetch_failed")
+                    set_span_error(span, "llm_fetch_failed")
+                raise LlmGatewayError("llm_fetch_failed", str(exc)) from exc
+
+            elapsed = time.perf_counter() - start
+            if span is not None:
+                span.set_attribute("http.response.status_code", resp.status_code)
+            if resp.status_code < 200 or resp.status_code >= 300:
+                body_text = resp.text[:500]
+                error_code = f"llm_http_{resp.status_code}"
+                logger.error(
+                    "LLM gateway returned HTTP %d after %.2fs: %s",
+                    resp.status_code,
+                    elapsed,
+                    body_text,
+                )
+                if span is not None:
+                    span.set_attribute("error.type", error_code)
+                    set_span_error(span, error_code)
+                raise LlmGatewayError(
+                    error_code, "non-2xx from LLM gateway", body_text
+                )
+
+            try:
+                payload = resp.json()
+                content = payload["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                logger.error(
+                    "LLM gateway returned an unexpected response shape: %s", exc
+                )
+                if span is not None:
+                    span.set_attribute("error.type", "llm_invalid_response_json")
+                    set_span_error(span, "llm_invalid_response_json")
+                raise LlmGatewayError("llm_invalid_response_json", str(exc)) from exc
+
+            if not isinstance(content, str):
+                if span is not None:
+                    span.set_attribute("error.type", "llm_invalid_response_json")
+                    set_span_error(span, "llm_invalid_response_json")
+                raise LlmGatewayError(
+                    "llm_invalid_response_json", "message content was not a string"
+                )
+
+            returned_model = payload.get("model", cfg.model_name)
+            if span is not None:
+                if isinstance(returned_model, str):
+                    span.set_attribute("gen_ai.response.model", returned_model)
+                usage = payload.get("usage")
+                if isinstance(usage, dict):
+                    _record_usage_attributes(span, usage)
+
+            logger.info(
+                "LLM gateway call ok in %.2fs (provider=%s model=%s)",
+                elapsed,
+                cfg.provider,
+                returned_model,
+            )
+            return content
+
+
+_OPENAI_COMPATIBLE_ADAPTER = OpenAICompatibleAdapter()
+
+
 async def call_chat_completion(
     messages: Sequence[ChatMessage],
     *,
@@ -180,127 +367,21 @@ async def call_chat_completion(
     use_response_format: bool = True,
     extra_body: Mapping[str, Any] | None = None,
 ) -> str:
-    """Call a configured chat-completion endpoint and return message content.
+    """Call a configured chat-completion endpoint and return message content."""
 
-    A single retry without `response_format` is attempted after HTTP 400 because
-    several OpenAI-compatible gateways reject that parameter even when they can
-    still produce JSON.
-    """
-
-    url = chat_completions_url(cfg.base_url)
-
-    def _body(with_response_format: bool) -> dict[str, Any]:
-        return chat_completion_body(
-            messages,
-            cfg=cfg,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format=(
-                {"type": "json_object"}
-                if with_response_format and use_response_format
-                else None
-            ),
-            extra_body=extra_body,
-        )
-
-    attributes: dict[str, str | int | float] = {
-        "gen_ai.operation.name": "chat",
-        "gen_ai.provider.name": cfg.provider,
-        "gen_ai.request.model": cfg.model_name,
-        "llmkit.timeout_seconds": timeout_seconds,
-    }
-    with trace_span(
-        "llm.chat_completion",
-        kind="client",
-        attributes=attributes,
-    ) as span:
-        headers = auth_headers(cfg)
-        inject_trace_context(headers)
-        start = time.perf_counter()
-        try:
-            resp = await http_client.post(
-                url,
-                headers=headers,
-                json=_body(True),
-                timeout=timeout_seconds,
-            )
-            if resp.status_code == 400 and use_response_format:
-                if span is not None:
-                    span.add_event(
-                        "llm.response_format_retry",
-                        {"http.response.status_code": 400},
-                    )
-                resp = await http_client.post(
-                    url,
-                    headers=headers,
-                    json=_body(False),
-                    timeout=timeout_seconds,
-                )
-        except httpx.TimeoutException as exc:
-            elapsed = time.perf_counter() - start
-            logger.error("LLM gateway timed out after %.2fs", elapsed)
-            if span is not None:
-                span.set_attribute("error.type", "llm_timeout")
-                set_span_error(span, "llm_timeout")
-            raise LlmGatewayError("llm_timeout", str(exc)) from exc
-        except httpx.HTTPError as exc:
-            elapsed = time.perf_counter() - start
-            logger.error("LLM gateway request failed after %.2fs: %s", elapsed, exc)
-            if span is not None:
-                span.set_attribute("error.type", "llm_fetch_failed")
-                set_span_error(span, "llm_fetch_failed")
-            raise LlmGatewayError("llm_fetch_failed", str(exc)) from exc
-
-        elapsed = time.perf_counter() - start
-        if span is not None:
-            span.set_attribute("http.response.status_code", resp.status_code)
-        if resp.status_code < 200 or resp.status_code >= 300:
-            body_text = resp.text[:500]
-            error_code = f"llm_http_{resp.status_code}"
-            logger.error(
-                "LLM gateway returned HTTP %d after %.2fs: %s",
-                resp.status_code,
-                elapsed,
-                body_text,
-            )
-            if span is not None:
-                span.set_attribute("error.type", error_code)
-                set_span_error(span, error_code)
-            raise LlmGatewayError(error_code, "non-2xx from LLM gateway", body_text)
-
-        try:
-            payload = resp.json()
-            content = payload["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            logger.error("LLM gateway returned an unexpected response shape: %s", exc)
-            if span is not None:
-                span.set_attribute("error.type", "llm_invalid_response_json")
-                set_span_error(span, "llm_invalid_response_json")
-            raise LlmGatewayError("llm_invalid_response_json", str(exc)) from exc
-
-        if not isinstance(content, str):
-            if span is not None:
-                span.set_attribute("error.type", "llm_invalid_response_json")
-                set_span_error(span, "llm_invalid_response_json")
-            raise LlmGatewayError(
-                "llm_invalid_response_json", "message content was not a string"
-            )
-
-        returned_model = payload.get("model", cfg.model_name)
-        if span is not None:
-            if isinstance(returned_model, str):
-                span.set_attribute("gen_ai.response.model", returned_model)
-            usage = payload.get("usage")
-            if isinstance(usage, dict):
-                _record_usage_attributes(span, usage)
-
-        logger.info(
-            "LLM gateway call ok in %.2fs (provider=%s model=%s)",
-            elapsed,
-            cfg.provider,
-            returned_model,
-        )
-        return content
+    request = ChatCompletionRequest(
+        messages=messages,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        temperature=temperature,
+        use_response_format=use_response_format,
+        extra_body=extra_body,
+    )
+    return await _OPENAI_COMPATIBLE_ADAPTER.complete(
+        request,
+        cfg=cfg,
+        http_client=http_client,
+    )
 
 
 def _record_usage_attributes(span: Any, usage: Mapping[str, Any]) -> None:

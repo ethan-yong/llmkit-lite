@@ -6,8 +6,10 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from llmkit_lite.llm import (
+    ChatCompletionRequest,
     LlmEndpointConfig,
     LlmGatewayError,
+    OpenAICompatibleAdapter,
     auth_headers,
     call_chat_completion,
     chat_completion_body,
@@ -154,6 +156,29 @@ async def test_call_chat_completion_success() -> None:
             timeout_seconds=5,
         )
     assert content == '{"ok": true}'
+
+
+async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert "routing_metadata" not in body
+        assert "private-value" not in request.content.decode()
+        return httpx.Response(200, content=_chat_content("done"))
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        routing_metadata={"tenant": "private-value"},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        content = await OpenAICompatibleAdapter().complete(
+            request,
+            cfg=_cfg(),
+            http_client=client,
+        )
+
+    assert content == "done"
 
 
 async def test_call_chat_completion_creates_safe_client_span(
