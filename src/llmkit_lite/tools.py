@@ -16,6 +16,7 @@ from llmkit_lite.authorization import (
     Principal,
     ScopeAuthorizationPolicy,
     get_principal,
+    principal_context,
     require_authorization,
 )
 from llmkit_lite.observability import set_span_error, trace_span
@@ -206,9 +207,15 @@ class AuthorizedToolExecutor:
 
             copied_arguments = dict(arguments)
             try:
-                result = definition.handler(copied_arguments)
-                if inspect.isawaitable(result):
-                    result = await result
+                if active_principal is None:
+                    result = definition.handler(copied_arguments)
+                    if inspect.isawaitable(result):
+                        result = await result
+                else:
+                    with principal_context(active_principal):
+                        result = definition.handler(copied_arguments)
+                        if inspect.isawaitable(result):
+                            result = await result
             except BaseException as exc:
                 exception_type = _exception_type(exc)
                 if span is not None:
