@@ -193,6 +193,56 @@ Requests accept `X-Request-ID` and optional `X-Thread-ID` headers. The middlewar
 keeps those identifiers isolated across concurrent requests and creates a server
 span when tracing is enabled.
 
+## Protected Tool Execution
+
+Register application tools with the scopes required to invoke them, then call
+them through `AuthorizedToolExecutor`. Authorization happens at the execution
+boundary before the handler receives any arguments:
+
+```python
+from collections.abc import Mapping
+from typing import Any
+
+from llmkit_lite.authorization import Principal, principal_context
+from llmkit_lite.tools import AuthorizedToolExecutor, ToolDefinition
+
+
+async def get_weather(arguments: Mapping[str, Any]) -> dict[str, str]:
+    city = str(arguments["city"])
+    return {"city": city, "forecast": "sunny"}
+
+
+tools = AuthorizedToolExecutor(
+    (
+        ToolDefinition(
+            name="weather",
+            handler=get_weather,
+            required_scopes={"tools:weather:execute"},
+        ),
+    )
+)
+
+principal = Principal(
+    subject="user-123",
+    scopes={"tools:weather:execute"},
+)
+
+with principal_context(principal):
+    result = await tools.execute("weather", {"city": "Kuala Lumpur"})
+```
+
+The default `ScopeAuthorizationPolicy` denies execution when there is no active
+principal, when the principal lacks any required scope, or when a tool declares
+an empty required-scope set. An application can pass a custom authorization
+policy to the executor; its reason codes should be stable identifiers and must
+not contain user information.
+
+Denied and unknown tools are never invoked. The executor supports synchronous
+and asynchronous handlers and passes an allowed handler a shallow copy of its
+arguments. Its audit logs and `tool.execute` spans contain only the registered
+tool name, outcome, stable reason code, and safe exception type. Subjects,
+scopes, arguments, results, credentials, and exception messages are excluded.
+
 ## Observability
 
 Tracing is disabled by default. Enable OTLP/HTTP export during application
