@@ -12,6 +12,7 @@ from llmkit_lite.authorization import (
     AuthorizationError,
     AuthorizationRequest,
     Principal,
+    get_principal,
     principal_context,
 )
 from llmkit_lite.tools import (
@@ -184,6 +185,28 @@ async def test_uses_active_principal_and_explicit_principal_takes_precedence() -
         )
 
     assert observed == ["context-user", "explicit-user"]
+
+
+async def test_explicit_principal_is_bound_during_async_handler() -> None:
+    observed: list[str | None] = []
+
+    async def handler(arguments: Mapping[str, Any]) -> str:
+        active = get_principal()
+        observed.append(active.subject if active is not None else None)
+        await asyncio.sleep(0)
+        active = get_principal()
+        observed.append(active.subject if active is not None else None)
+        return "ok"
+
+    executor = AuthorizedToolExecutor((_definition(handler),))
+    outer = Principal("outer")
+    explicit = _principal("explicit")
+
+    with principal_context(outer):
+        assert await executor.execute("weather", {}, principal=explicit) == "ok"
+        assert get_principal() is outer
+
+    assert observed == ["explicit", "explicit"]
 
 
 async def test_policy_receives_only_authorization_metadata() -> None:

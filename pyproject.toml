@@ -18,6 +18,7 @@ graphs = [
   "langgraph>=1.2.0,<2.0",
 ]
 mcp = [
+  "jsonschema>=4.26.0,<5.0",
   "mcp>=2.2.0,<3.0",
 ]
 cli = [

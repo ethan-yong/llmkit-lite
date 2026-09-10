@@ -26,6 +26,7 @@ uv add "llmkit-lite[api]"
 uv add "llmkit-lite[graphs]"
 uv add "llmkit-lite[cli]"
 uv add "llmkit-lite[observability]"
+uv add "llmkit-lite[mcp]"
 ```
 
 ## Configuration
@@ -242,6 +243,87 @@ and asynchronous handlers and passes an allowed handler a shallow copy of its
 arguments. Its audit logs and `tool.execute` spans contain only the registered
 tool name, outcome, stable reason code, and safe exception type. Subjects,
 scopes, arguments, results, credentials, and exception messages are excluded.
+
+## Secure MCP Tool Execution
+
+MCP integrations use two separate steps: discover the tools exposed by a
+configured server, then place only approved tools behind the same authorization
+boundary as local application tools. Server descriptions and input schemas are
+remote, untrusted data; review them before making discovered tools available.
+
+Keep credentials in a dedicated authentication provider. It receives the active
+principal and registered server name, but never receives tool arguments:
+
+```python
+import os
+from collections.abc import Mapping
+
+from llmkit_lite.authorization import Principal
+from llmkit_lite.mcp import (
+    AuthorizedMcpToolExecutor,
+    McpExecutionPolicy,
+    McpServer,
+    McpServerRegistry,
+    StreamableHttpMcpAdapter,
+)
+
+
+class EnvironmentTokenProvider:
+    async def get_headers(
+        self,
+        principal: Principal | None,
+        server_name: str,
+    ) -> Mapping[str, str]:
+        return {"Authorization": f"Bearer {os.environ['DOCS_MCP_TOKEN']}"}
+
+
+registry = McpServerRegistry(
+    (
+        McpServer(
+            name="docs",
+            endpoint="https://mcp.example.com/mcp",
+            adapter=StreamableHttpMcpAdapter(),
+            authentication_provider=EnvironmentTokenProvider(),
+        ),
+    )
+)
+
+tools = await registry.discover_tools()
+executor = AuthorizedMcpToolExecutor(
+    registry,
+    tools,
+    required_scopes={
+        "docs.search": {"mcp:docs.search:execute"},
+    },
+    execution_policy=McpExecutionPolicy(
+        timeout_seconds=30,
+        idempotency_ttl_seconds=300,
+    ),
+)
+
+result = await executor.execute(
+    "docs.search",
+    {"query": "provider routing"},
+    principal=Principal(
+        "user-123",
+        scopes={"mcp:docs.search:execute"},
+    ),
+    idempotency_key="search-request-123",
+)
+```
+
+The default scope policy denies unauthenticated callers, missing scopes, and
+tools without an explicit scope declaration. Authorization and JSON Schema
+validation happen before credentials are resolved or a remote request is sent.
+Calls have a 30-second default timeout and are attempted once: this layer does
+not silently retry remote tools because many tools have side effects.
+
+An idempotency key deduplicates matching calls for the same principal and tool.
+The built-in store is process-local, keeps successful results for five minutes,
+and is suitable for a single application process. Use a shared implementation
+of `McpIdempotencyStore` when multiple processes must coordinate. Never place
+tokens in endpoint URLs, tool arguments, logs, or traces; MCP telemetry records
+only server/tool names, outcomes, and stable error codes.
 
 ## Observability
 
