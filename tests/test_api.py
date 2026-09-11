@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from llmkit_lite.api import (
     get_request_id,
     http_client_lifespan,
     llm_exception_handler,
+    runtime_lifespan,
 )
 from llmkit_lite.llm import LlmGatewayError
 from llmkit_lite.observability import (
@@ -25,6 +27,7 @@ from llmkit_lite.observability import (
 from llmkit_lite.observability import (
     get_request_id as get_observability_request_id,
 )
+from llmkit_lite.runtime import ApplicationRuntime, RuntimeDependency
 
 
 async def test_request_id_middleware_uses_header_and_isolates_concurrent_requests():
@@ -169,6 +172,58 @@ async def test_http_client_lifespan_sets_and_closes_client() -> None:
     async with lifespan(app):
         assert app.state.http_client.closed is False
     assert app.state.http_client.closed is True
+
+
+async def test_runtime_lifespan_exposes_runtime_and_closes_resources() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def client_resource():
+        events.append("start")
+        try:
+            yield "client"
+        finally:
+            events.append("stop")
+
+    runtime = ApplicationRuntime(
+        (
+            RuntimeDependency(
+                "client",
+                lambda dependencies: client_resource(),
+            ),
+        )
+    )
+    app = FastAPI(lifespan=runtime_lifespan(runtime))
+    lifespan = runtime_lifespan(runtime)
+
+    async with lifespan(app):
+        assert app.state.runtime is runtime
+        assert app.state.runtime.get("client") == "client"
+
+    assert events == ["start", "stop"]
+    assert runtime.started is False
+    with pytest.raises(AttributeError):
+        _ = app.state.runtime
+
+
+async def test_runtime_lifespan_restores_existing_state_value() -> None:
+    runtime = ApplicationRuntime(())
+    app = FastAPI()
+    app.state.services = "previous"
+
+    async with runtime_lifespan(runtime, state_attr=" services ")(app):
+        assert app.state.services is runtime
+
+    assert app.state.services == "previous"
+
+
+def test_runtime_lifespan_validates_inputs() -> None:
+    with pytest.raises(TypeError, match="ApplicationRuntime"):
+        runtime_lifespan(object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="must be a string"):
+        runtime_lifespan(ApplicationRuntime(()), state_attr=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must not be empty"):
+        runtime_lifespan(ApplicationRuntime(()), state_attr=" ")
 
 
 async def test_llm_exception_handler_maps_errors() -> None:
