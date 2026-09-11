@@ -20,6 +20,7 @@ from llmkit_lite.observability import (
     trace_span,
 )
 from llmkit_lite.observability import get_request_id as _get_request_id
+from llmkit_lite.runtime import ApplicationRuntime
 
 DEFAULT_LOG_FORMAT = (
     "%(asctime)s %(levelname)s "
@@ -147,6 +148,47 @@ def http_client_lifespan(
             yield
         finally:
             await client.aclose()
+
+    return _lifespan
+
+
+def runtime_lifespan(
+    runtime: ApplicationRuntime,
+    *,
+    state_attr: str = "runtime",
+):
+    """Expose an application runtime for one FastAPI lifespan."""
+
+    if not isinstance(runtime, ApplicationRuntime):
+        raise TypeError("runtime must be an ApplicationRuntime")
+    if not isinstance(state_attr, str):
+        raise TypeError("runtime state attribute must be a string")
+    normalized_state_attr = state_attr.strip()
+    if not normalized_state_attr:
+        raise ValueError("runtime state attribute must not be empty")
+
+    @asynccontextmanager
+    async def _lifespan(app: Any):
+        missing = object()
+        previous = getattr(app.state, normalized_state_attr, missing)
+        await runtime.start()
+        attached = False
+        try:
+            setattr(app.state, normalized_state_attr, runtime)
+            attached = True
+            yield
+        finally:
+            try:
+                await runtime.close()
+            finally:
+                if attached:
+                    if previous is missing:
+                        try:
+                            delattr(app.state, normalized_state_attr)
+                        except AttributeError:
+                            pass
+                    else:
+                        setattr(app.state, normalized_state_attr, previous)
 
     return _lifespan
 

@@ -194,6 +194,57 @@ Requests accept `X-Request-ID` and optional `X-Thread-ID` headers. The middlewar
 keeps those identifiers isolated across concurrent requests and creates a server
 span when tracing is enabled.
 
+## Application Runtime
+
+Use `ApplicationRuntime` as the application composition root for dependencies
+that should be created once and shared across requests. Dependencies start in
+declaration order and managed resources close in reverse order:
+
+```python
+import httpx
+from fastapi import FastAPI, Request
+
+from llmkit_lite.api import runtime_lifespan
+from llmkit_lite.runtime import ApplicationRuntime, RuntimeDependency
+
+
+runtime = ApplicationRuntime(
+    (
+        RuntimeDependency(
+            name="http_client",
+            factory=lambda dependencies: httpx.AsyncClient(),
+        ),
+        RuntimeDependency(
+            name="support_service",
+            requires=("http_client",),
+            factory=lambda dependencies: build_support_service(
+                http_client=dependencies["http_client"],
+            ),
+        ),
+    )
+)
+app = FastAPI(lifespan=runtime_lifespan(runtime))
+
+
+@app.get("/health")
+async def health(request: Request) -> dict[str, bool]:
+    service = request.app.state.runtime.get("support_service")
+    return {"ready": service.is_ready()}
+```
+
+A factory receives a read-only snapshot containing dependencies initialized
+before it. Its `requires` entries must therefore refer to earlier declarations.
+Factories may return plain values, awaitables, synchronous context managers, or
+asynchronous context managers. The runtime publishes no values until every
+factory has succeeded; partial startup is cleaned up automatically.
+
+Do not let both `ApplicationRuntime` and `http_client_lifespan()` manage the same
+HTTP client. Choose one owner for each resource so it is closed exactly once.
+Runtime spans contain only dependency names, counts, outcomes, and stable error
+codes—not dependency values, credentials, configuration, or exception messages.
+Configuration loading, secret-store integration, and deployment setup remain
+the consuming application's responsibility.
+
 ## Protected Tool Execution
 
 Register application tools with the scopes required to invoke them, then call
