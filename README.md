@@ -498,6 +498,47 @@ authenticated, authorized application boundary. Workflow state, resume values,
 thread IDs, checkpoint namespaces, and exception messages are excluded from the
 built-in execution spans.
 
+### Versioned application state
+
+Use a `StateStore` implementation for application-owned state that must be
+coordinated separately from LangGraph checkpoints. Conversation snapshots are
+addressed by `WorkflowIdentity`; operation snapshots additionally carry a
+stable operation ID and idempotency key:
+
+```python
+from llmkit_lite.graphs import WorkflowIdentity
+from llmkit_lite.state import InMemoryStateStore
+
+
+state_store = InMemoryStateStore()
+identity = WorkflowIdentity("support-thread-123", "support-agent")
+
+created = await state_store.save_conversation(
+    identity,
+    {"messages": [{"role": "user", "content": "check router"}]},
+)
+updated = await state_store.save_conversation(
+    identity,
+    {"messages": [{"role": "assistant", "content": "checking"}]},
+    expected_revision=created.revision,
+)
+```
+
+Every update uses the previously read revision. A stale writer receives a
+`state_revision_conflict` error instead of silently overwriting newer state.
+Stored values are copied, deeply immutable, and limited to JSON-compatible
+data so persistence adapters can serialize them consistently. State records
+provide `to_dict()` when a detached, JSON-ready representation is needed.
+
+`InMemoryStateStore` is a concurrency-safe reference implementation for tests
+and local development, but it loses data when the process exits. Production
+applications should implement the `StateStore` protocol with durable storage
+and inject that implementation through `ApplicationRuntime`.
+
+The LangGraph checkpointer remains the source of truth for graph checkpoints.
+Operation state is stored separately because a downstream side effect may need
+to be reconciled even when a worker crashes between dispatch and checkpointing.
+
 ## Evaluations
 
 Cases can be JSON arrays or JSONL records:
