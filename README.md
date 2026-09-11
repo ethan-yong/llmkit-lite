@@ -370,6 +370,67 @@ result = await run_cached_graph(
 )
 ```
 
+### Checkpointed and resumable workflows
+
+Compile a graph with an injected LangGraph checkpointer, then use the same
+`CheckpointConfig` when a later request resumes an interrupted workflow:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+from llmkit_lite.graphs import (
+    CheckpointConfig,
+    CheckpointedGraph,
+    CheckpointedWorkflowRunner,
+    WorkflowExecutionPolicy,
+)
+
+
+checkpointed_graph = CheckpointedGraph(
+    builder=lambda checkpointer: build_graph().compile(
+        checkpointer=checkpointer,
+    ),
+    checkpointer=InMemorySaver(),
+)
+runner = CheckpointedWorkflowRunner(
+    checkpointed_graph,
+    execution_policy=WorkflowExecutionPolicy(deadline_seconds=30),
+)
+checkpoint = CheckpointConfig(
+    thread_id="support-thread-123",
+    checkpoint_namespace="support-agent",
+)
+
+started = await runner.start(
+    {"request": "reboot router"},
+    checkpoint,
+    configurable={"http_client": request.app.state.http_client},
+)
+
+if started.interrupted:
+    approval_request = started.interrupts[0]
+    # Return approval_request.value to the authorized approval interface.
+    resumed = await runner.resume(
+        {"approved": True},
+        checkpoint,
+        configurable={"http_client": request.app.state.http_client},
+    )
+```
+
+`InMemorySaver` is useful for local development and tests, but loses workflow
+state when the process restarts. Production applications should inject a
+durable LangGraph-compatible checkpointer. A resume must use the same thread ID
+and namespace as the interrupted execution; a new thread ID starts an unrelated
+workflow.
+
+The runner applies a 30-second overall deadline by default. Cancellation and
+deadline expiry stop the local execution, but an external service may already
+have accepted a side effect. Nodes that can be replayed around an interruption
+should therefore use idempotency keys. Resume values must come from an
+authenticated, authorized application boundary. Workflow state, resume values,
+thread IDs, checkpoint namespaces, and exception messages are excluded from the
+built-in execution spans.
+
 ## Evaluations
 
 Cases can be JSON arrays or JSONL records:
