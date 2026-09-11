@@ -539,6 +539,52 @@ The LangGraph checkpointer remains the source of truth for graph checkpoints.
 Operation state is stored separately because a downstream side effect may need
 to be reconciled even when a worker crashes between dispatch and checkpointing.
 
+### Durable operation lifecycle
+
+Use `OperationLifecycle` to move an external operation through explicit,
+versioned statuses:
+
+```python
+from llmkit_lite.operations import OperationLifecycle
+from llmkit_lite.state import OperationStatus
+
+
+lifecycle = OperationLifecycle(state_store)
+operation = await lifecycle.create(
+    "reboot-789",
+    identity,
+    "reboot-key-789",
+    {"device_id": "router-1"},
+)
+
+# Persist this before sending the command to the downstream service.
+operation = await lifecycle.transition(
+    operation.operation_id,
+    OperationStatus.DISPATCHING,
+    expected_revision=operation.revision,
+)
+```
+
+Allowed transitions are:
+
+```text
+pending      -> dispatching, failed
+dispatching  -> in_progress, completed, failed
+in_progress  -> completed, failed
+completed    -> terminal
+failed       -> terminal
+```
+
+`dispatching` deliberately represents an uncertain outcome. If a worker fails
+after sending a command, a replacement worker must leave the operation in that
+state until it can reconcile the downstream result. A timeout, connection
+failure, or inability to query status does not prove that the command failed.
+
+Every transition uses the current revision, so concurrent workers cannot both
+advance the same operation. Lifecycle spans contain only statuses, revisions,
+outcomes, and stable error codes; operation IDs, thread IDs, idempotency keys,
+and stored values are excluded.
+
 ## Evaluations
 
 Cases can be JSON arrays or JSONL records:

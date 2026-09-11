@@ -6,6 +6,7 @@ import asyncio
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -85,6 +86,16 @@ class StateStoreError(Exception):
         self.detail = detail
 
 
+class OperationStatus(StrEnum):
+    """Persisted lifecycle status for an external operation."""
+
+    PENDING = "pending"
+    DISPATCHING = "dispatching"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationState:
     """Immutable, versioned snapshot of one conversation's runtime values."""
@@ -121,6 +132,7 @@ class OperationState:
     operation_id: str
     identity: WorkflowIdentity
     idempotency_key: str
+    status: OperationStatus
     revision: int
     values: Mapping[str, Any]
 
@@ -137,6 +149,8 @@ class OperationState:
             "idempotency_key",
             _normalize_identifier(self.idempotency_key, "idempotency key"),
         )
+        if not isinstance(self.status, OperationStatus):
+            raise TypeError("operation status must be an OperationStatus")
         object.__setattr__(
             self,
             "revision",
@@ -152,6 +166,7 @@ class OperationState:
             "thread_id": self.identity.thread_id,
             "checkpoint_namespace": self.identity.checkpoint_namespace,
             "idempotency_key": self.idempotency_key,
+            "status": self.status.value,
             "revision": self.revision,
             "values": _thaw_json(self.values),
         }
@@ -183,6 +198,7 @@ class StateStore(Protocol):
         operation_id: str,
         identity: WorkflowIdentity,
         idempotency_key: str,
+        status: OperationStatus,
         values: Mapping[str, Any],
         *,
         expected_revision: int | None = None,
@@ -238,6 +254,7 @@ class InMemoryStateStore:
         operation_id: str,
         identity: WorkflowIdentity,
         idempotency_key: str,
+        status: OperationStatus,
         values: Mapping[str, Any],
         *,
         expected_revision: int | None = None,
@@ -245,6 +262,8 @@ class InMemoryStateStore:
         resolved_id = _normalize_identifier(operation_id, "operation ID")
         resolved_identity = _require_identity(identity, "operation identity")
         resolved_key = _normalize_identifier(idempotency_key, "idempotency key")
+        if not isinstance(status, OperationStatus):
+            raise TypeError("operation status must be an OperationStatus")
         resolved_expected = _normalize_expected_revision(expected_revision)
         frozen_values = _freeze_values(values)
 
@@ -260,6 +279,7 @@ class InMemoryStateStore:
                 operation_id=resolved_id,
                 identity=resolved_identity,
                 idempotency_key=resolved_key,
+                status=status,
                 revision=revision,
                 values=frozen_values,
             )

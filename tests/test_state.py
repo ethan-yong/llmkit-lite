@@ -11,6 +11,7 @@ from llmkit_lite.state import (
     ConversationState,
     InMemoryStateStore,
     OperationState,
+    OperationStatus,
     StateStoreError,
 )
 
@@ -43,6 +44,7 @@ def test_operation_state_normalizes_identifiers_and_freezes_values() -> None:
         operation_id=" reboot-123 ",
         identity=WorkflowIdentity("thread-123"),
         idempotency_key=" reboot-key-123 ",
+        status=OperationStatus.PENDING,
         revision=1,
         values={"request": {"device": "router-1"}},
     )
@@ -61,6 +63,7 @@ def test_state_records_export_detached_json_compatible_values() -> None:
         "operation-123",
         identity,
         "key-123",
+        OperationStatus.COMPLETED,
         3,
         {"result": {"accepted": True}},
     )
@@ -81,6 +84,7 @@ def test_state_records_export_detached_json_compatible_values() -> None:
         "thread_id": "thread-123",
         "checkpoint_namespace": "support",
         "idempotency_key": "key-123",
+        "status": "completed",
         "revision": 3,
         "values": {"result": {"accepted": True}},
     }
@@ -121,6 +125,7 @@ def test_state_records_export_detached_json_compatible_values() -> None:
                 " ",
                 WorkflowIdentity("thread"),
                 "key",
+                OperationStatus.PENDING,
                 1,
                 {},
             ),
@@ -131,10 +136,22 @@ def test_state_records_export_detached_json_compatible_values() -> None:
                 "operation",
                 WorkflowIdentity("thread"),
                 " ",
+                OperationStatus.PENDING,
                 1,
                 {},
             ),
             ValueError,
+        ),
+        (
+            lambda: OperationState(
+                "operation",
+                WorkflowIdentity("thread"),
+                "key",
+                "pending",
+                1,
+                {},
+            ),
+            TypeError,
         ),
     ],
 )
@@ -189,18 +206,22 @@ async def test_store_creates_loads_and_updates_operation_state() -> None:
         " reboot-123 ",
         identity,
         " reboot-key-123 ",
+        OperationStatus.PENDING,
         {"command": {"device": "router-1"}},
     )
     updated = await store.save_operation(
         "reboot-123",
         identity,
         "reboot-key-123",
+        OperationStatus.DISPATCHING,
         {"downstream_id": "command-456"},
         expected_revision=created.revision,
     )
 
     assert created.operation_id == "reboot-123"
     assert created.idempotency_key == "reboot-key-123"
+    assert created.status is OperationStatus.PENDING
+    assert updated.status is OperationStatus.DISPATCHING
     assert updated.revision == 2
     assert updated.values == {"downstream_id": "command-456"}
     assert await store.get_operation(" reboot-123 ") is updated
@@ -215,6 +236,7 @@ async def test_conversation_and_operation_records_use_separate_namespaces() -> N
         "shared-id",
         identity,
         "operation-key",
+        OperationStatus.PENDING,
         {"kind": "operation"},
     )
 
@@ -260,6 +282,7 @@ async def test_operation_identity_and_idempotency_key_cannot_change() -> None:
         "operation-123",
         identity,
         "key-123",
+        OperationStatus.PENDING,
         {},
     )
 
@@ -268,6 +291,7 @@ async def test_operation_identity_and_idempotency_key_cannot_change() -> None:
             "operation-123",
             WorkflowIdentity("other-thread"),
             "key-123",
+            OperationStatus.DISPATCHING,
             {"private": "identity conflict"},
             expected_revision=created.revision,
         )
@@ -278,6 +302,7 @@ async def test_operation_identity_and_idempotency_key_cannot_change() -> None:
             "operation-123",
             identity,
             "other-key",
+            OperationStatus.DISPATCHING,
             {"private": "key conflict"},
             expected_revision=created.revision,
         )
