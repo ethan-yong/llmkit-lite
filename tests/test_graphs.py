@@ -14,6 +14,7 @@ from llmkit_lite.graphs import (
     CheckpointedWorkflowRunner,
     WorkflowExecutionError,
     WorkflowExecutionPolicy,
+    WorkflowIdentity,
     WorkflowInterrupt,
     WorkflowRunResult,
     checkpointed_graph_config,
@@ -21,6 +22,7 @@ from llmkit_lite.graphs import (
     langgraph_config,
     list_extend_reducer,
     run_cached_graph,
+    workflow_run_config,
 )
 
 
@@ -88,16 +90,23 @@ def test_cached_graph_builds_once_and_resets() -> None:
     assert calls["n"] == 2
 
 
-def test_checkpoint_config_normalizes_and_is_frozen() -> None:
-    checkpoint = CheckpointConfig(
+def test_workflow_identity_normalizes_and_is_frozen() -> None:
+    identity = WorkflowIdentity(
         " support-thread-123 ",
         " support-agent ",
     )
 
-    assert checkpoint.thread_id == "support-thread-123"
-    assert checkpoint.checkpoint_namespace == "support-agent"
+    assert identity.thread_id == "support-thread-123"
+    assert identity.checkpoint_namespace == "support-agent"
     with pytest.raises(FrozenInstanceError):
-        checkpoint.thread_id = "changed"  # type: ignore[misc]
+        identity.thread_id = "changed"  # type: ignore[misc]
+
+
+def test_checkpoint_config_remains_a_compatibility_alias() -> None:
+    identity = CheckpointConfig("thread-123", "support")
+
+    assert isinstance(identity, WorkflowIdentity)
+    assert identity == WorkflowIdentity("thread-123", "support")
 
 
 @pytest.mark.parametrize(
@@ -116,6 +125,13 @@ def test_checkpoint_config_rejects_invalid_identifiers(
 ) -> None:
     with pytest.raises(expected_error):
         factory()
+
+
+def test_workflow_identity_rejects_invalid_identifiers() -> None:
+    with pytest.raises(ValueError):
+        WorkflowIdentity(" ")
+    with pytest.raises(TypeError):
+        WorkflowIdentity(1)  # type: ignore[arg-type]
 
 
 def test_checkpointed_graph_builds_once_with_injected_checkpointer() -> None:
@@ -185,6 +201,34 @@ def test_checkpointed_graph_config_preserves_dependencies_and_extras() -> None:
     }
     assert dependencies == {"http_client": "client", "values": [1]}
     assert config["configurable"] is not dependencies
+
+
+def test_workflow_run_config_separates_identity_from_runtime_state() -> None:
+    state = {"messages": [{"role": "user", "content": "status"}]}
+    dependencies = {"http_client": "client"}
+
+    config = workflow_run_config(
+        WorkflowIdentity("thread-123", "support"),
+        dependencies,
+        recursion_limit=25,
+    )
+
+    assert config == {
+        "configurable": {
+            "http_client": "client",
+            "thread_id": "thread-123",
+            "checkpoint_ns": "support",
+        },
+        "recursion_limit": 25,
+    }
+    assert "messages" not in config
+    assert state == {"messages": [{"role": "user", "content": "status"}]}
+    assert dependencies == {"http_client": "client"}
+
+
+def test_workflow_run_config_validates_identity() -> None:
+    with pytest.raises(TypeError, match="WorkflowIdentity"):
+        workflow_run_config(object())  # type: ignore[arg-type]
 
 
 def test_checkpointed_graph_config_omits_unset_namespace() -> None:
@@ -307,6 +351,27 @@ async def test_workflow_start_passes_state_config_and_overall_deadline() -> None
         )
     ]
     assert dependencies == {"http_client": "client"}
+    assert "question" not in graph.calls[0][1]
+    assert "question" not in graph.calls[0][1]["configurable"]
+
+
+async def test_workflow_runner_accepts_legacy_checkpoint_keyword() -> None:
+    graph = ScriptedWorkflowGraph({"answer": "done"})
+    runner = _workflow_runner(graph)
+
+    await runner.start({}, checkpoint=CheckpointConfig("thread-123"))
+
+    assert graph.calls[0][1]["configurable"]["thread_id"] == "thread-123"
+
+
+async def test_workflow_runner_requires_exactly_one_identity() -> None:
+    runner = _workflow_runner(ScriptedWorkflowGraph({"answer": "done"}))
+    identity = WorkflowIdentity("thread-123")
+
+    with pytest.raises(TypeError, match="WorkflowIdentity"):
+        await runner.start({})
+    with pytest.raises(TypeError, match="either identity or checkpoint"):
+        await runner.start({}, identity, checkpoint=identity)
 
 
 async def test_workflow_start_returns_pending_interruptions() -> None:

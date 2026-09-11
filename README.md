@@ -423,17 +423,31 @@ result = await run_cached_graph(
 
 ### Checkpointed and resumable workflows
 
+LLM applications carry several kinds of values with different lifetimes:
+
+| Category | Examples | Lifetime |
+| --- | --- | --- |
+| Application configuration | Model routes, timeouts, checkpointer provider | Deployment |
+| Runtime dependency | HTTP client, router, checkpointer instance | Process |
+| Workflow identity | Thread ID, checkpoint namespace | Conversation |
+| Workflow state | Messages, findings, pending approval | Workflow step |
+
+Application configuration should be resolved when the service starts and used
+to construct dependencies managed by `ApplicationRuntime`. Conversation state
+is passed to the graph and persisted by its checkpointer; it must not be stored
+inside application configuration.
+
 Compile a graph with an injected LangGraph checkpointer, then use the same
-`CheckpointConfig` when a later request resumes an interrupted workflow:
+`WorkflowIdentity` when a later request resumes an interrupted workflow:
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
 
 from llmkit_lite.graphs import (
-    CheckpointConfig,
     CheckpointedGraph,
     CheckpointedWorkflowRunner,
     WorkflowExecutionPolicy,
+    WorkflowIdentity,
 )
 
 
@@ -447,14 +461,14 @@ runner = CheckpointedWorkflowRunner(
     checkpointed_graph,
     execution_policy=WorkflowExecutionPolicy(deadline_seconds=30),
 )
-checkpoint = CheckpointConfig(
+identity = WorkflowIdentity(
     thread_id="support-thread-123",
     checkpoint_namespace="support-agent",
 )
 
 started = await runner.start(
     {"request": "reboot router"},
-    checkpoint,
+    identity,
     configurable={"http_client": request.app.state.http_client},
 )
 
@@ -463,7 +477,7 @@ if started.interrupted:
     # Return approval_request.value to the authorized approval interface.
     resumed = await runner.resume(
         {"approved": True},
-        checkpoint,
+        identity,
         configurable={"http_client": request.app.state.http_client},
     )
 ```
@@ -472,7 +486,9 @@ if started.interrupted:
 state when the process restarts. Production applications should inject a
 durable LangGraph-compatible checkpointer. A resume must use the same thread ID
 and namespace as the interrupted execution; a new thread ID starts an unrelated
-workflow.
+workflow. `CheckpointConfig` and `checkpointed_graph_config()` remain available
+as compatibility names, but new code should use `WorkflowIdentity` and
+`workflow_run_config()`.
 
 The runner applies a 30-second overall deadline by default. Cancellation and
 deadline expiry stop the local execution, but an external service may already

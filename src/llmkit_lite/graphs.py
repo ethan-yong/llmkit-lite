@@ -46,8 +46,8 @@ def _normalize_positive_number(value: float, field_name: str) -> float:
 
 
 @dataclass(frozen=True, slots=True)
-class CheckpointConfig:
-    """Stable workflow identity used by LangGraph checkpointers."""
+class WorkflowIdentity:
+    """Stable runtime identity used to locate checkpointed workflow state."""
 
     thread_id: str
     checkpoint_namespace: str | None = None
@@ -56,7 +56,7 @@ class CheckpointConfig:
         object.__setattr__(
             self,
             "thread_id",
-            _normalize_identifier(self.thread_id, "checkpoint thread ID"),
+            _normalize_identifier(self.thread_id, "workflow thread ID"),
         )
         if self.checkpoint_namespace is not None:
             object.__setattr__(
@@ -67,6 +67,23 @@ class CheckpointConfig:
                     "checkpoint namespace",
                 ),
             )
+
+
+# Backwards-compatible name retained for callers using the original API. A
+# workflow identity locates runtime state; it is not application configuration.
+CheckpointConfig = WorkflowIdentity
+
+
+def _resolve_workflow_identity(
+    identity: WorkflowIdentity | None,
+    checkpoint: WorkflowIdentity | None,
+) -> WorkflowIdentity:
+    if identity is not None and checkpoint is not None:
+        raise TypeError("provide either identity or checkpoint, not both")
+    resolved = identity if identity is not None else checkpoint
+    if not isinstance(resolved, WorkflowIdentity):
+        raise TypeError("workflow identity must be a WorkflowIdentity")
+    return resolved
 
 
 class Checkpointer(Protocol):
@@ -221,9 +238,7 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
         if not isinstance(graph, CheckpointedGraph):
             raise TypeError("graph must be a CheckpointedGraph")
         resolved_policy = (
-            WorkflowExecutionPolicy()
-            if execution_policy is None
-            else execution_policy
+            WorkflowExecutionPolicy() if execution_policy is None else execution_policy
         )
         if not isinstance(resolved_policy, WorkflowExecutionPolicy):
             raise TypeError("execution policy must be WorkflowExecutionPolicy")
@@ -239,8 +254,9 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
     async def start(
         self,
         state: StateT,
-        checkpoint: CheckpointConfig,
+        identity: WorkflowIdentity | None = None,
         *,
+        checkpoint: WorkflowIdentity | None = None,
         configurable: Mapping[str, Any] | None = None,
         deadline_seconds: float | None = None,
         **extra_config: Any,
@@ -250,7 +266,7 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
         return await self._execute(
             "start",
             lambda: state,
-            checkpoint,
+            _resolve_workflow_identity(identity, checkpoint),
             configurable=configurable,
             deadline_seconds=deadline_seconds,
             extra_config=extra_config,
@@ -259,8 +275,9 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
     async def resume(
         self,
         value: Any,
-        checkpoint: CheckpointConfig,
+        identity: WorkflowIdentity | None = None,
         *,
+        checkpoint: WorkflowIdentity | None = None,
         configurable: Mapping[str, Any] | None = None,
         deadline_seconds: float | None = None,
         **extra_config: Any,
@@ -270,7 +287,7 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
         return await self._execute(
             "resume",
             lambda: self._resume_factory(value),
-            checkpoint,
+            _resolve_workflow_identity(identity, checkpoint),
             configurable=configurable,
             deadline_seconds=deadline_seconds,
             extra_config=extra_config,
@@ -280,7 +297,7 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
         self,
         operation_name: str,
         input_factory: Callable[[], Any],
-        checkpoint: CheckpointConfig,
+        identity: WorkflowIdentity,
         *,
         configurable: Mapping[str, Any] | None,
         deadline_seconds: float | None,
@@ -294,8 +311,8 @@ class CheckpointedWorkflowRunner(Generic[GraphT]):
                 "workflow deadline",
             )
         )
-        config = checkpointed_graph_config(
-            checkpoint,
+        config = workflow_run_config(
+            identity,
             configurable,
             **extra_config,
         )
@@ -388,22 +405,22 @@ def langgraph_config(
     return config
 
 
-def checkpointed_graph_config(
-    checkpoint: CheckpointConfig,
+def workflow_run_config(
+    identity: WorkflowIdentity,
     configurable: Mapping[str, Any] | None = None,
     **extra_config: Any,
 ) -> dict[str, Any]:
-    """Build a LangGraph config with one authoritative checkpoint identity."""
+    """Build execution configuration with one authoritative workflow identity."""
 
-    if not isinstance(checkpoint, CheckpointConfig):
-        raise TypeError("checkpoint must be a CheckpointConfig")
+    if not isinstance(identity, WorkflowIdentity):
+        raise TypeError("identity must be a WorkflowIdentity")
     if configurable is not None and not isinstance(configurable, Mapping):
         raise TypeError("configurable dependencies must be a mapping or None")
 
     merged = dict(configurable or {})
-    reserved = {"thread_id": checkpoint.thread_id}
-    if checkpoint.checkpoint_namespace is not None:
-        reserved["checkpoint_ns"] = checkpoint.checkpoint_namespace
+    reserved = {"thread_id": identity.thread_id}
+    if identity.checkpoint_namespace is not None:
+        reserved["checkpoint_ns"] = identity.checkpoint_namespace
 
     for key in ("thread_id", "checkpoint_ns"):
         if key not in merged:
@@ -413,6 +430,18 @@ def checkpointed_graph_config(
 
     merged.update(reserved)
     return langgraph_config(merged, **extra_config)
+
+
+def checkpointed_graph_config(
+    checkpoint: CheckpointConfig,
+    configurable: Mapping[str, Any] | None = None,
+    **extra_config: Any,
+) -> dict[str, Any]:
+    """Compatibility wrapper for :func:`workflow_run_config`."""
+
+    if not isinstance(checkpoint, CheckpointConfig):
+        raise TypeError("checkpoint must be a CheckpointConfig")
+    return workflow_run_config(checkpoint, configurable, **extra_config)
 
 
 async def invoke_graph(
