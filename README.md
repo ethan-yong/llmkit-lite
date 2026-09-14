@@ -545,16 +545,18 @@ Use `OperationLifecycle` to move an external operation through explicit,
 versioned statuses:
 
 ```python
-from llmkit_lite.operations import OperationLifecycle
+from llmkit_lite.operations import OperationLifecycle, OperationRequest
 from llmkit_lite.state import OperationStatus
 
 
 lifecycle = OperationLifecycle(state_store)
+request = OperationRequest("reboot", {"device_id": "router-1"})
 operation = await lifecycle.create(
     "reboot-789",
     identity,
     "reboot-key-789",
-    {"device_id": "router-1"},
+    request.fingerprint,
+    {"request": request.to_dict()},
 )
 
 # Persist this before sending the command to the downstream service.
@@ -584,6 +586,59 @@ Every transition uses the current revision, so concurrent workers cannot both
 advance the same operation. Lifecycle spans contain only statuses, revisions,
 outcomes, and stable error codes; operation IDs, thread IDs, idempotency keys,
 and stored values are excluded.
+
+### Idempotent execution and crash recovery
+
+`DurableOperationExecutor` combines request fingerprinting, lifecycle updates,
+dispatch, and read-only reconciliation:
+
+```python
+from llmkit_lite.operations import DurableOperationExecutor
+
+
+executor = DurableOperationExecutor(lifecycle, downstream_adapter)
+result = await executor.execute(
+    "reboot-789",
+    identity,
+    "reboot-key-789",
+    request,
+)
+```
+
+The downstream adapter implements two methods. `dispatch()` sends a new command
+and may cause a side effect. `inspect()` only reads the status of a previously
+dispatched operation. Both return an `OperationObservation` with an outcome of
+`in_progress`, `completed`, `failed`, or `unknown`.
+
+Execution follows this recovery-safe sequence:
+
+```text
+Create pending record
+        ↓
+Persist dispatching
+        ↓
+Send downstream command
+        ↓
+Worker crashes before checkpoint
+        ↓
+New executor receives the repeated request
+        ↓
+Find existing idempotency key and matching request fingerprint
+        ↓
+Inspect downstream instead of resending
+        ↓
+Persist completed, in_progress, or confirmed failure
+```
+
+A repeated key with an identical request reuses the existing operation. Reusing
+the key with a different action or values raises
+`operation_idempotency_conflict`. Timeouts and connection failures during
+dispatch leave the record as `dispatching`; inspection failures and `unknown`
+observations also preserve the current status instead of assuming failure.
+
+`InMemoryMcpIdempotencyStore` remains a process-local single-flight optimization
+for MCP calls. Durable workflow protection comes from `DurableOperationExecutor`
+and requires a `StateStore` implementation that survives process restarts.
 
 ## Evaluations
 

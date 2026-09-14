@@ -14,6 +14,7 @@ from llmkit_lite.graphs import WorkflowIdentity
 
 _ERROR_DETAILS = {
     "state_already_exists": "state record already exists",
+    "state_idempotency_conflict": "idempotency key is already registered",
     "state_revision_conflict": "state record revision does not match",
     "state_record_not_found": "state record was not found",
     "state_invalid_record": "state record conflicts with persisted identity",
@@ -132,6 +133,7 @@ class OperationState:
     operation_id: str
     identity: WorkflowIdentity
     idempotency_key: str
+    request_fingerprint: str
     status: OperationStatus
     revision: int
     values: Mapping[str, Any]
@@ -148,6 +150,11 @@ class OperationState:
             self,
             "idempotency_key",
             _normalize_identifier(self.idempotency_key, "idempotency key"),
+        )
+        object.__setattr__(
+            self,
+            "request_fingerprint",
+            _normalize_identifier(self.request_fingerprint, "request fingerprint"),
         )
         if not isinstance(self.status, OperationStatus):
             raise TypeError("operation status must be an OperationStatus")
@@ -166,6 +173,7 @@ class OperationState:
             "thread_id": self.identity.thread_id,
             "checkpoint_namespace": self.identity.checkpoint_namespace,
             "idempotency_key": self.idempotency_key,
+            "request_fingerprint": self.request_fingerprint,
             "status": self.status.value,
             "revision": self.revision,
             "values": _thaw_json(self.values),
@@ -193,11 +201,19 @@ class StateStore(Protocol):
     async def get_operation(self, operation_id: str) -> OperationState | None:
         """Return the latest operation snapshot, if one exists."""
 
+    async def get_operation_by_idempotency_key(
+        self,
+        identity: WorkflowIdentity,
+        idempotency_key: str,
+    ) -> OperationState | None:
+        """Return the operation registered for one conversation-scoped key."""
+
     async def save_operation(
         self,
         operation_id: str,
         identity: WorkflowIdentity,
         idempotency_key: str,
+        request_fingerprint: str,
         status: OperationStatus,
         values: Mapping[str, Any],
         *,
@@ -212,6 +228,7 @@ class InMemoryStateStore:
     def __init__(self) -> None:
         self._conversations: dict[WorkflowIdentity, ConversationState] = {}
         self._operations: dict[str, OperationState] = {}
+        self._operation_keys: dict[tuple[WorkflowIdentity, str], str] = {}
         self._lock = asyncio.Lock()
 
     async def get_conversation(
@@ -249,11 +266,23 @@ class InMemoryStateStore:
         async with self._lock:
             return self._operations.get(resolved_id)
 
+    async def get_operation_by_idempotency_key(
+        self,
+        identity: WorkflowIdentity,
+        idempotency_key: str,
+    ) -> OperationState | None:
+        resolved_identity = _require_identity(identity, "operation identity")
+        resolved_key = _normalize_identifier(idempotency_key, "idempotency key")
+        async with self._lock:
+            operation_id = self._operation_keys.get((resolved_identity, resolved_key))
+            return None if operation_id is None else self._operations.get(operation_id)
+
     async def save_operation(
         self,
         operation_id: str,
         identity: WorkflowIdentity,
         idempotency_key: str,
+        request_fingerprint: str,
         status: OperationStatus,
         values: Mapping[str, Any],
         *,
@@ -262,6 +291,10 @@ class InMemoryStateStore:
         resolved_id = _normalize_identifier(operation_id, "operation ID")
         resolved_identity = _require_identity(identity, "operation identity")
         resolved_key = _normalize_identifier(idempotency_key, "idempotency key")
+        resolved_fingerprint = _normalize_identifier(
+            request_fingerprint,
+            "request fingerprint",
+        )
         if not isinstance(status, OperationStatus):
             raise TypeError("operation status must be an OperationStatus")
         resolved_expected = _normalize_expected_revision(expected_revision)
@@ -269,21 +302,27 @@ class InMemoryStateStore:
 
         async with self._lock:
             current = self._operations.get(resolved_id)
+            indexed_id = self._operation_keys.get((resolved_identity, resolved_key))
+            if current is None and indexed_id is not None and indexed_id != resolved_id:
+                raise StateStoreError("state_idempotency_conflict")
             revision = _next_revision(current, resolved_expected)
             if current is not None and (
                 current.identity != resolved_identity
                 or current.idempotency_key != resolved_key
+                or current.request_fingerprint != resolved_fingerprint
             ):
                 raise StateStoreError("state_invalid_record")
             state = OperationState(
                 operation_id=resolved_id,
                 identity=resolved_identity,
                 idempotency_key=resolved_key,
+                request_fingerprint=resolved_fingerprint,
                 status=status,
                 revision=revision,
                 values=frozen_values,
             )
             self._operations[resolved_id] = state
+            self._operation_keys[(resolved_identity, resolved_key)] = resolved_id
             return state
 
 
