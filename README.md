@@ -423,17 +423,31 @@ result = await run_cached_graph(
 
 ### Checkpointed and resumable workflows
 
+LLM applications carry several kinds of values with different lifetimes:
+
+| Category | Examples | Lifetime |
+| --- | --- | --- |
+| Application configuration | Model routes, timeouts, checkpointer provider | Deployment |
+| Runtime dependency | HTTP client, router, checkpointer instance | Process |
+| Workflow identity | Thread ID, checkpoint namespace | Conversation |
+| Workflow state | Messages, findings, pending approval | Workflow step |
+
+Application configuration should be resolved when the service starts and used
+to construct dependencies managed by `ApplicationRuntime`. Conversation state
+is passed to the graph and persisted by its checkpointer; it must not be stored
+inside application configuration.
+
 Compile a graph with an injected LangGraph checkpointer, then use the same
-`CheckpointConfig` when a later request resumes an interrupted workflow:
+`WorkflowIdentity` when a later request resumes an interrupted workflow:
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
 
 from llmkit_lite.graphs import (
-    CheckpointConfig,
     CheckpointedGraph,
     CheckpointedWorkflowRunner,
     WorkflowExecutionPolicy,
+    WorkflowIdentity,
 )
 
 
@@ -447,14 +461,14 @@ runner = CheckpointedWorkflowRunner(
     checkpointed_graph,
     execution_policy=WorkflowExecutionPolicy(deadline_seconds=30),
 )
-checkpoint = CheckpointConfig(
+identity = WorkflowIdentity(
     thread_id="support-thread-123",
     checkpoint_namespace="support-agent",
 )
 
 started = await runner.start(
     {"request": "reboot router"},
-    checkpoint,
+    identity,
     configurable={"http_client": request.app.state.http_client},
 )
 
@@ -463,7 +477,7 @@ if started.interrupted:
     # Return approval_request.value to the authorized approval interface.
     resumed = await runner.resume(
         {"approved": True},
-        checkpoint,
+        identity,
         configurable={"http_client": request.app.state.http_client},
     )
 ```
@@ -472,7 +486,9 @@ if started.interrupted:
 state when the process restarts. Production applications should inject a
 durable LangGraph-compatible checkpointer. A resume must use the same thread ID
 and namespace as the interrupted execution; a new thread ID starts an unrelated
-workflow.
+workflow. `CheckpointConfig` and `checkpointed_graph_config()` remain available
+as compatibility names, but new code should use `WorkflowIdentity` and
+`workflow_run_config()`.
 
 The runner applies a 30-second overall deadline by default. Cancellation and
 deadline expiry stop the local execution, but an external service may already
@@ -481,6 +497,148 @@ should therefore use idempotency keys. Resume values must come from an
 authenticated, authorized application boundary. Workflow state, resume values,
 thread IDs, checkpoint namespaces, and exception messages are excluded from the
 built-in execution spans.
+
+### Versioned application state
+
+Use a `StateStore` implementation for application-owned state that must be
+coordinated separately from LangGraph checkpoints. Conversation snapshots are
+addressed by `WorkflowIdentity`; operation snapshots additionally carry a
+stable operation ID and idempotency key:
+
+```python
+from llmkit_lite.graphs import WorkflowIdentity
+from llmkit_lite.state import InMemoryStateStore
+
+
+state_store = InMemoryStateStore()
+identity = WorkflowIdentity("support-thread-123", "support-agent")
+
+created = await state_store.save_conversation(
+    identity,
+    {"messages": [{"role": "user", "content": "check router"}]},
+)
+updated = await state_store.save_conversation(
+    identity,
+    {"messages": [{"role": "assistant", "content": "checking"}]},
+    expected_revision=created.revision,
+)
+```
+
+Every update uses the previously read revision. A stale writer receives a
+`state_revision_conflict` error instead of silently overwriting newer state.
+Stored values are copied, deeply immutable, and limited to JSON-compatible
+data so persistence adapters can serialize them consistently. State records
+provide `to_dict()` when a detached, JSON-ready representation is needed.
+
+`InMemoryStateStore` is a concurrency-safe reference implementation for tests
+and local development, but it loses data when the process exits. Production
+applications should implement the `StateStore` protocol with durable storage
+and inject that implementation through `ApplicationRuntime`.
+
+The LangGraph checkpointer remains the source of truth for graph checkpoints.
+Operation state is stored separately because a downstream side effect may need
+to be reconciled even when a worker crashes between dispatch and checkpointing.
+
+### Durable operation lifecycle
+
+Use `OperationLifecycle` to move an external operation through explicit,
+versioned statuses:
+
+```python
+from llmkit_lite.operations import OperationLifecycle, OperationRequest
+from llmkit_lite.state import OperationStatus
+
+
+lifecycle = OperationLifecycle(state_store)
+request = OperationRequest("reboot", {"device_id": "router-1"})
+operation = await lifecycle.create(
+    "reboot-789",
+    identity,
+    "reboot-key-789",
+    request.fingerprint,
+    {"request": request.to_dict()},
+)
+
+# Persist this before sending the command to the downstream service.
+operation = await lifecycle.transition(
+    operation.operation_id,
+    OperationStatus.DISPATCHING,
+    expected_revision=operation.revision,
+)
+```
+
+Allowed transitions are:
+
+```text
+pending      -> dispatching, failed
+dispatching  -> in_progress, completed, failed
+in_progress  -> completed, failed
+completed    -> terminal
+failed       -> terminal
+```
+
+`dispatching` deliberately represents an uncertain outcome. If a worker fails
+after sending a command, a replacement worker must leave the operation in that
+state until it can reconcile the downstream result. A timeout, connection
+failure, or inability to query status does not prove that the command failed.
+
+Every transition uses the current revision, so concurrent workers cannot both
+advance the same operation. Lifecycle spans contain only statuses, revisions,
+outcomes, and stable error codes; operation IDs, thread IDs, idempotency keys,
+and stored values are excluded.
+
+### Idempotent execution and crash recovery
+
+`DurableOperationExecutor` combines request fingerprinting, lifecycle updates,
+dispatch, and read-only reconciliation:
+
+```python
+from llmkit_lite.operations import DurableOperationExecutor
+
+
+executor = DurableOperationExecutor(lifecycle, downstream_adapter)
+result = await executor.execute(
+    "reboot-789",
+    identity,
+    "reboot-key-789",
+    request,
+)
+```
+
+The downstream adapter implements two methods. `dispatch()` sends a new command
+and may cause a side effect. `inspect()` only reads the status of a previously
+dispatched operation. Both return an `OperationObservation` with an outcome of
+`in_progress`, `completed`, `failed`, or `unknown`.
+
+Execution follows this recovery-safe sequence:
+
+```text
+Create pending record
+        ↓
+Persist dispatching
+        ↓
+Send downstream command
+        ↓
+Worker crashes before checkpoint
+        ↓
+New executor receives the repeated request
+        ↓
+Find existing idempotency key and matching request fingerprint
+        ↓
+Inspect downstream instead of resending
+        ↓
+Persist completed, in_progress, or confirmed failure
+```
+
+A repeated key with an identical request reuses the existing operation. Reusing
+the key with a different action or values raises
+`operation_idempotency_conflict`. Timeouts and connection failures during
+dispatch leave the record as `dispatching`; inspection failures and `unknown`
+observations also preserve the current status instead of assuming failure.
+
+`InMemoryMcpIdempotencyStore` remains a process-local single-flight optimization
+for MCP calls. Durable workflow protection comes from `DurableOperationExecutor`
+and requires a `StateStore` implementation that survives process restarts.
 
 ## Evaluations
 
