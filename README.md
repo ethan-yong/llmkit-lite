@@ -640,6 +640,40 @@ observations also preserve the current status instead of assuming failure.
 for MCP calls. Durable workflow protection comes from `DurableOperationExecutor`
 and requires a `StateStore` implementation that survives process restarts.
 
+### Atomic worker lease acquisition
+
+Use a lease when multiple workers may receive the same durable operation. The
+store performs the ownership decision atomically, so two workers cannot both
+acquire the same unexpired lease:
+
+```python
+from datetime import timedelta
+
+from llmkit_lite.leases import InMemoryLeaseStore, LeaseManager
+
+
+lease_manager = LeaseManager(
+    InMemoryLeaseStore(),
+    lease_duration=timedelta(seconds=30),
+)
+claim = await lease_manager.acquire("reboot-789", "worker-42")
+
+if claim.owns_lease:
+    # This worker may begin processing the operation.
+    ...
+```
+
+An absent or expired lease is acquired with a new revision. A retry by the
+current owner returns `already_owned` without extending the expiry, while a
+different worker receives `held_by_other`. At the exact expiration time the
+lease is eligible for takeover. The revision records persistence changes only;
+fencing-token enforcement and heartbeat renewal are separate concerns.
+
+`InMemoryLeaseStore` is suitable for tests and local development but cannot
+coordinate separate processes or survive restarts. A production `LeaseStore`
+must implement `acquire_lease()` as one atomic database operation rather than a
+read followed by a write.
+
 ## Evaluations
 
 Cases can be JSON arrays or JSONL records:
