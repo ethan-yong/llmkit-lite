@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>LLMKit Settings</title>
+    <link rel="stylesheet" href="assets/settings.css">
+    <script src="assets/settings.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar" aria-label="Settings navigation">
+        <a class="brand" href="#provider" aria-label="LLMKit settings home">
+          <span class="brand-mark">L</span>
+          <span>
+            <strong>LLMKit</strong>
+            <small>Control room</small>
+          </span>
+        </a>
+
+        <nav class="nav-list">
+          <a class="nav-item active" href="#provider">
+            <span class="nav-number">01</span>
+            Provider
+          </a>
+          <a class="nav-item" href="#generation">
+            <span class="nav-number">02</span>
+            Generation
+          </a>
+          <a class="nav-item" href="#reliability">
+            <span class="nav-number">03</span>
+            Reliability
+          </a>
+          <a class="nav-item" href="#observability">
+            <span class="nav-number">04</span>
+            Observability
+          </a>
+          <a class="nav-item" href="#workflow">
+            <span class="nav-number">05</span>
+            Workflow
+          </a>
+        </nav>
+
+        <div class="sidebar-note">
+          <span class="status-dot"></span>
+          <div>
+            <strong>Local access only</strong>
+            <small>Secrets stay on this machine.</small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Application configuration</p>
+            <h1>Settings</h1>
+            <p class="lede">Configure your model stack without touching code.</p>
+          </div>
+          <div class="save-state" id="save-state" data-state="loading">
+            <span class="save-state-dot"></span>
+            <span id="save-state-label">Loading settings</span>
+          </div>
+        </header>
+
+        <noscript>
+          <div class="notice error">JavaScript is required to use this dashboard.</div>
+        </noscript>
+
+        <form id="settings-form" novalidate>
+          <section class="settings-section" id="provider">
+            <div class="section-heading">
+              <div>
+                <span class="section-index">01</span>
+                <h2>Model provider</h2>
+              </div>
+              <p>Choose the OpenAI-compatible service that handles requests.</p>
+            </div>
+
+            <div class="card">
+              <div class="field-grid two-column">
+                <label class="field">
+                  <span class="field-label">Provider</span>
+                  <select data-path="llm.provider" id="provider-select">
+                    <option value="local">Local / custom</option>
+                    <option value="vllm">vLLM</option>
+                    <option value="litellm">LiteLLM</option>
+                    <option value="deepseek">DeepSeek</option>
+                  </select>
+                  <small>All options use an OpenAI-compatible API.</small>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">Model name</span>
+                  <input
+                    data-path="llm.model_name"
+                    id="model-name"
+                    list="available-models"
+                    autocomplete="off"
+                    placeholder="qwen2.5"
+                    required
+                  >
+                  <datalist id="available-models"></datalist>
+                  <small>The exact model ID exposed by your provider.</small>
+                </label>
+
+                <label class="field field-wide">
+                  <span class="field-label">Base URL</span>
+                  <input
+                    data-path="llm.base_url"
+                    id="base-url"
+                    type="url"
+                    inputmode="url"
+                    autocomplete="url"
+                    placeholder="http://127.0.0.1:4000"
+                    required
+                  >
+                  <small>The dashboard adds <code>/v1</code> when needed.</small>
+                </label>
+
+                <label class="field">
+                  <span class="field-label-row">
+                    <span class="field-label">API key</span>
+                    <span class="secret-state" id="secret-state">Not configured</span>
+                  </span>
+                  <span class="password-field">
+                    <input
+                      data-path="llm.api_key"
+                      id="api-key"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="Leave blank to keep saved key"
+                    >
+                    <button class="icon-button" id="toggle-secret" type="button" aria-label="Show API key">Show</button>
+                  </span>
+                  <label class="clear-secret">
+                    <input id="clear-api-key" type="checkbox">
+                    Remove the saved key
+                  </label>
+                </label>
+
+                <label class="field" id="reasoning-field">
+                  <span class="field-label">Reasoning effort</span>
+                  <select data-path="llm.reasoning_effort">
+                    <option value="">Provider default</option>
+                    <option value="none">None</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                  <small>Used when the selected endpoint supports it.</small>
+                </label>
+              </div>
+
+              <div class="connection-panel">
+                <div>
+                  <strong>Connection check</strong>
+                  <p id="connection-message">Save your settings, then verify the models endpoint.</p>
+                </div>
+                <button class="button secondary" id="test-connection" type="button">
+                  Test connection
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section" id="generation">
+            <div class="section-heading">
+              <div>
+                <span class="section-index">02</span>
+                <h2>Generation defaults</h2>
+              </div>
+              <p>Starting values for every chat-completion request.</p>
+            </div>
+
+            <div class="card">
+              <div class="field-grid four-column">
+                <label class="field">
+                  <span class="field-label">Maximum tokens</span>
+                  <input data-path="generation.max_tokens" type="number" min="1" max="1000000" step="1" required>
+                  <small>Maximum response length.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Timeout</span>
+                  <span class="unit-field">
+                    <input data-path="generation.timeout_seconds" type="number" min="0.1" max="3600" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Per-request deadline.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Temperature</span>
+                  <input data-path="generation.temperature" type="number" min="0" max="2" step="0.1" required>
+                  <small>Lower is more predictable.</small>
+                </label>
+                <label class="field toggle-field">
+                  <span>
+                    <span class="field-label">Structured output</span>
+                    <small>Ask for JSON response format.</small>
+                  </span>
+                  <input data-path="generation.use_response_format" class="toggle" type="checkbox">
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section" id="reliability">
+            <div class="section-heading">
+              <div>
+                <span class="section-index">03</span>
+                <h2>Reliability</h2>
+              </div>
+              <p>Control retries, backoff, and circuit-breaker recovery.</p>
+            </div>
+
+            <div class="card">
+              <div class="subheading">
+                <h3>Retry policy</h3>
+                <span>Applied independently to each route</span>
+              </div>
+              <div class="field-grid four-column">
+                <label class="field">
+                  <span class="field-label">Attempts per route</span>
+                  <input data-path="reliability.max_attempts_per_route" type="number" min="1" max="20" step="1" required>
+                </label>
+                <label class="field">
+                  <span class="field-label">Initial backoff</span>
+                  <span class="unit-field">
+                    <input data-path="reliability.initial_backoff_seconds" type="number" min="0" max="300" step="0.05" required>
+                    <span>sec</span>
+                  </span>
+                </label>
+                <label class="field">
+                  <span class="field-label">Backoff multiplier</span>
+                  <span class="unit-field">
+                    <input data-path="reliability.backoff_multiplier" type="number" min="1" max="10" step="0.1" required>
+                    <span>×</span>
+                  </span>
+                </label>
+                <label class="field">
+                  <span class="field-label">Maximum backoff</span>
+                  <span class="unit-field">
+                    <input data-path="reliability.max_backoff_seconds" type="number" min="0" max="3600" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                </label>
+                <label class="field">
+                  <span class="field-label">Jitter</span>
+                  <span class="unit-field">
+                    <input data-path="reliability.jitter_ratio" type="number" min="0" max="1" step="0.05" required>
+                    <span>ratio</span>
+                  </span>
+                </label>
+              </div>
+
+              <div class="divider"></div>
+
+              <div class="subheading">
+                <h3>Circuit breaker</h3>
+                <span>Pause unhealthy routes before trying again</span>
+              </div>
+              <div class="field-grid two-column compact-grid">
+                <label class="field">
+                  <span class="field-label">Failure threshold</span>
+                  <input data-path="reliability.circuit_failure_threshold" type="number" min="1" max="10000" step="1" required>
+                  <small>Failures before the circuit opens.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Recovery timeout</span>
+                  <span class="unit-field">
+                    <input data-path="reliability.circuit_recovery_timeout_seconds" type="number" min="0.1" max="86400" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Wait before testing the provider again.</small>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section" id="observability">
+            <div class="section-heading">
+              <div>
+                <span class="section-index">04</span>
+                <h2>Observability</h2>
+              </div>
+              <p>Choose what the service reports to logs and tracing.</p>
+            </div>
+
+            <div class="card">
+              <label class="feature-toggle">
+                <span>
+                  <strong>OpenTelemetry tracing</strong>
+                  <small>Export request and workflow spans to an OTLP collector.</small>
+                </span>
+                <input data-path="observability.tracing_enabled" class="toggle" type="checkbox">
+              </label>
+
+              <div class="field-grid two-column tracing-fields">
+                <label class="field">
+                  <span class="field-label">Service name</span>
+                  <input data-path="observability.service_name" required>
+                </label>
+                <label class="field">
+                  <span class="field-label">Service version</span>
+                  <input data-path="observability.service_version" placeholder="0.1.0">
+                </label>
+                <label class="field">
+                  <span class="field-label">Environment</span>
+                  <input data-path="observability.environment" placeholder="development">
+                </label>
+                <label class="field">
+                  <span class="field-label">Log level</span>
+                  <select data-path="observability.log_level">
+                    <option>DEBUG</option>
+                    <option>INFO</option>
+                    <option>WARNING</option>
+                    <option>ERROR</option>
+                    <option>CRITICAL</option>
+                  </select>
+                </label>
+                <label class="field field-wide">
+                  <span class="field-label">OTLP endpoint</span>
+                  <input data-path="observability.otlp_endpoint" type="url" placeholder="http://127.0.0.1:4318">
+                  <small>Optional when tracing is disabled or configured elsewhere.</small>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="settings-section" id="workflow">
+            <div class="section-heading">
+              <div>
+                <span class="section-index">05</span>
+                <h2>Workflow recovery</h2>
+              </div>
+              <p>Timing for graph execution, worker leases, and queue delivery.</p>
+            </div>
+
+            <div class="card">
+              <div class="field-grid four-column">
+                <label class="field">
+                  <span class="field-label">Execution timeout</span>
+                  <span class="unit-field">
+                    <input data-path="workflow.execution_timeout_seconds" type="number" min="0.1" max="86400" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Overall graph deadline.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Lease duration</span>
+                  <span class="unit-field">
+                    <input data-path="workflow.lease_duration_seconds" type="number" min="0.1" max="86400" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Worker ownership window.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Queue visibility</span>
+                  <span class="unit-field">
+                    <input data-path="workflow.queue_visibility_seconds" type="number" min="0.1" max="86400" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Time before redelivery.</small>
+                </label>
+                <label class="field">
+                  <span class="field-label">Heartbeat interval</span>
+                  <span class="unit-field">
+                    <input data-path="workflow.heartbeat_interval_seconds" type="number" min="0.1" max="86400" step="0.1" required>
+                    <span>sec</span>
+                  </span>
+                  <small>Must be shorter than both windows.</small>
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <div class="action-bar">
+            <div>
+              <strong>Ready to apply?</strong>
+              <span>Running workers may need a restart to load new settings.</span>
+            </div>
+            <button class="button primary" id="save-settings" type="submit">
+              Save changes
+            </button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import webbrowser
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -20,6 +22,54 @@ from llmkit_lite.llm import (
 )
 
 app = typer.Typer(no_args_is_help=True, help="Utilities for production LLM services.")
+
+
+@app.command("settings")
+def settings_dashboard(
+    host: Annotated[str, typer.Option(help="Address used by the settings server.")] = (
+        "127.0.0.1"
+    ),
+    port: Annotated[
+        int,
+        typer.Option(min=1, max=65535, help="Port used by the settings server."),
+    ] = 8765,
+    settings_file: Annotated[
+        Path,
+        typer.Option(help="Local JSON file managed by the dashboard."),
+    ] = Path(".llmkit/settings.json"),
+    open_browser: Annotated[
+        bool,
+        typer.Option("--open-browser/--no-open-browser"),
+    ] = True,
+    allow_remote: Annotated[
+        bool,
+        typer.Option(help="Allow non-local clients. Add authentication upstream."),
+    ] = False,
+) -> None:
+    """Open the local web dashboard for application configuration."""
+
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise typer.BadParameter(
+            "Install llmkit-lite[api] to run the settings dashboard"
+        ) from exc
+
+    from llmkit_lite.dashboard import create_settings_app
+    from llmkit_lite.settings import SettingsStore
+
+    dashboard = create_settings_app(
+        SettingsStore(settings_file),
+        local_only=not allow_remote,
+    )
+    browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    url = f"http://{browser_host}:{port}/"
+    typer.echo(f"LLMKit settings: {url}")
+    if open_browser:
+        timer = threading.Timer(0.7, webbrowser.open, args=(url,))
+        timer.daemon = True
+        timer.start()
+    uvicorn.run(dashboard, host=host, port=port, log_level="warning")
 
 
 def _load_dotenv(path: Path | None) -> None:
