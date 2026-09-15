@@ -15,6 +15,7 @@ import httpx
 
 from llmkit_lite.llm import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     LlmEndpointConfig,
     LlmGatewayError,
     LlmProviderAdapter,
@@ -292,7 +293,7 @@ class LlmRouter:
         *,
         http_client: httpx.AsyncClient,
         span: Any,
-    ) -> str:
+    ) -> ChatCompletionResponse:
         for attempt in range(1, self._policy.max_attempts_per_route + 1):
             _add_event(
                 span,
@@ -300,11 +301,16 @@ class LlmRouter:
                 _route_attributes(route, attempt=attempt),
             )
             try:
-                return await route.adapter.complete(
+                response = await route.adapter.complete(
                     request,
                     cfg=route.endpoint,
                     http_client=http_client,
                 )
+                if not isinstance(response, ChatCompletionResponse):
+                    raise TypeError(
+                        "LLM provider adapters must return ChatCompletionResponse"
+                    )
+                return response
             except LlmGatewayError as exc:
                 _add_event(
                     span,
@@ -336,13 +342,13 @@ class LlmRouter:
                 await self._sleep(delay)
         raise AssertionError("retry loop completed without returning or raising")
 
-    async def complete(
+    async def complete_response(
         self,
         request: ChatCompletionRequest,
         *,
         http_client: httpx.AsyncClient,
-    ) -> str:
-        """Resolve a route, retry it, and use its flat fallback chain."""
+    ) -> ChatCompletionResponse:
+        """Resolve a route and return its normalized provider response."""
 
         primary = self.resolve(request)
         candidate_names = (primary.name, *primary.fallback_routes)
@@ -451,6 +457,22 @@ class LlmRouter:
                 span.set_attribute("error.type", error.code)
                 set_span_error(span, error.code)
             raise error
+
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        http_client: httpx.AsyncClient,
+    ) -> str:
+        """Resolve a route and return text for compatibility-oriented callers."""
+
+        response = await self.complete_response(request, http_client=http_client)
+        if response.text is None:
+            raise LlmGatewayError(
+                "llm_text_response_required",
+                "LLM response did not contain text content",
+            )
+        return response.text
 
 
 def _route_attributes(

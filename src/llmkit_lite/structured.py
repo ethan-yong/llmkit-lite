@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from llmkit_lite.llm import ChatMessage, LlmEndpointConfig, call_chat_completion
+from llmkit_lite.llm import (
+    ChatMessageInput,
+    LlmEndpointConfig,
+    call_chat_completion,
+)
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -115,7 +120,7 @@ def parse_structured_json(
 
 
 async def structured_json_call(
-    messages: list[ChatMessage],
+    messages: Sequence[ChatMessageInput],
     *,
     response_model: type[TModel],
     cfg: LlmEndpointConfig,

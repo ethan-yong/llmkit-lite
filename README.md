@@ -108,6 +108,36 @@ async def summarize(text: str) -> str:
         )
 ```
 
+Provider adapters return a normalized `ChatCompletionResponse` containing text,
+tool calls, finish reason, token usage, provider, model, and a deliberately small
+set of safe provider metadata. Use the response helper when those fields matter:
+
+```python
+import httpx
+
+from llmkit_lite.llm import (
+    ChatCompletionResponse,
+    call_chat_completion_response,
+    resolve_llm_config,
+)
+
+
+async def inspect_router() -> ChatCompletionResponse:
+    cfg = resolve_llm_config()
+    async with httpx.AsyncClient() as client:
+        return await call_chat_completion_response(
+            [{"role": "user", "content": "Inspect router 42"}],
+            cfg=cfg,
+            http_client=client,
+            max_tokens=300,
+            timeout_seconds=20,
+        )
+```
+
+`call_chat_completion()` remains a text-only compatibility helper. It raises
+`llm_text_response_required` when a valid response contains tool calls but no
+text, so callers do not silently discard the requested action.
+
 ## Resilient Provider Routing
 
 Use `LlmRouter` when an application needs to select between providers, retry
@@ -174,6 +204,10 @@ async def complete(messages: list[dict[str, str]]) -> str:
     async with httpx.AsyncClient() as client:
         return await router.complete(request, http_client=client)
 ```
+
+Use `router.complete_response()` instead when the application needs the full
+normalized response. Retries and fallbacks return the selected adapter's
+response without translating it again.
 
 The default resilience policy tries each eligible route twice, with exponential
 backoff and jitter. A route's circuit opens after three consecutive calls exhaust

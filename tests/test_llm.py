@@ -7,11 +7,16 @@ from opentelemetry.trace import StatusCode
 
 from llmkit_lite.llm import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
     LlmEndpointConfig,
     LlmGatewayError,
     OpenAICompatibleAdapter,
+    TokenUsage,
+    ToolCall,
     auth_headers,
     call_chat_completion,
+    call_chat_completion_response,
     chat_completion_body,
     chat_completions_url,
     normalize_api_base,
@@ -140,6 +145,38 @@ def test_chat_completion_body() -> None:
     }
 
 
+def test_chat_completion_body_serializes_normalized_tool_calls() -> None:
+    body = chat_completion_body(
+        [
+            ChatMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall("call-1", "lookup", {"device_id": "router-1"}),
+                ),
+            )
+        ],
+        cfg=_cfg(),
+        max_tokens=50,
+    )
+
+    assert body["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"device_id":"router-1"}',
+                    },
+                }
+            ],
+        }
+    ]
+
+
 async def test_call_chat_completion_success() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -172,13 +209,195 @@ async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
         routing_metadata={"tenant": "private-value"},
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        content = await OpenAICompatibleAdapter().complete(
+        response = await OpenAICompatibleAdapter().complete(
             request,
             cfg=_cfg(),
             http_client=client,
         )
 
-    assert content == "done"
+    assert response.text == "done"
+    assert response.provider == "local"
+    assert response.model == "test-model"
+
+
+def test_chat_completion_request_normalizes_and_detaches_messages() -> None:
+    source = {"role": "user", "content": "hello"}
+
+    request = ChatCompletionRequest(
+        messages=[source],
+        max_tokens=100,
+        timeout_seconds=5,
+    )
+    source["content"] = "changed"
+
+    assert request.messages == (ChatMessage(role="user", content="hello"),)
+
+
+def test_normalized_models_freeze_nested_provider_values() -> None:
+    arguments = {"filters": ["active"]}
+    metadata = {"region": {"name": "west"}}
+
+    tool_call = ToolCall("call-1", "lookup", arguments)
+    response = ChatCompletionResponse(
+        text=None,
+        provider="local",
+        model="test-model",
+        tool_calls=(tool_call,),
+        provider_metadata=metadata,
+    )
+    arguments["filters"].append("private")
+    metadata["region"]["name"] = "changed"
+
+    assert tool_call.arguments["filters"] == ("active",)
+    assert response.provider_metadata["region"]["name"] == "west"
+    with pytest.raises(TypeError):
+        response.provider_metadata["new"] = "value"  # type: ignore[index]
+
+
+async def test_call_chat_completion_response_normalizes_tool_calls_and_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-1",
+                "created": 123,
+                "system_fingerprint": "fp-safe",
+                "model": "returned-model",
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"device_id":"router-1"}',
+                                    },
+                                },
+                                {
+                                    "id": "call-2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_status",
+                                        "arguments": '{"include_history":true}',
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "inspect router"}],
+            cfg=_cfg(),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+        )
+
+    assert response == ChatCompletionResponse(
+        text=None,
+        provider="local",
+        model="returned-model",
+        tool_calls=(
+            ToolCall("call-1", "lookup", {"device_id": "router-1"}),
+            ToolCall("call-2", "get_status", {"include_history": True}),
+        ),
+        finish_reason="tool_calls",
+        usage=TokenUsage(input_tokens=7, output_tokens=3, total_tokens=10),
+        provider_metadata={
+            "response_id": "response-1",
+            "created": 123,
+            "system_fingerprint": "fp-safe",
+        },
+    )
+
+
+async def test_text_helper_rejects_tool_only_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    assert exc_info.value.code == "llm_text_response_required"
+
+
+async def test_invalid_tool_arguments_raise_stable_response_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "not-json",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    assert exc_info.value.code == "llm_invalid_response_json"
 
 
 async def test_call_chat_completion_creates_safe_client_span(

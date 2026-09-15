@@ -5,8 +5,10 @@ import pytest
 
 from llmkit_lite.llm import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     LlmEndpointConfig,
     LlmGatewayError,
+    ToolCall,
 )
 from llmkit_lite.routing import (
     LlmResiliencePolicy,
@@ -14,6 +16,14 @@ from llmkit_lite.routing import (
     LlmRouter,
     LlmRouteRule,
 )
+
+
+def _response(text: str, provider: str = "test") -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        text=text,
+        provider=provider,
+        model=f"{provider}-model",
+    )
 
 
 class RecordingAdapter:
@@ -29,9 +39,9 @@ class RecordingAdapter:
         *,
         cfg: LlmEndpointConfig,
         http_client: httpx.AsyncClient,
-    ) -> str:
+    ) -> ChatCompletionResponse:
         self.calls.append((request, cfg, http_client))
-        return self.result
+        return _response(self.result, cfg.provider)
 
 
 class ScriptedAdapter(RecordingAdapter):
@@ -45,14 +55,14 @@ class ScriptedAdapter(RecordingAdapter):
         *,
         cfg: LlmEndpointConfig,
         http_client: httpx.AsyncClient,
-    ) -> str:
+    ) -> ChatCompletionResponse:
         self.calls.append((request, cfg, http_client))
         if not self.outcomes:
             raise AssertionError("scripted adapter has no remaining outcome")
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
-        return outcome
+        return _response(outcome, cfg.provider)
 
 
 class FakeClock:
@@ -78,13 +88,13 @@ class BlockingProbeAdapter(RecordingAdapter):
         *,
         cfg: LlmEndpointConfig,
         http_client: httpx.AsyncClient,
-    ) -> str:
+    ) -> ChatCompletionResponse:
         self.calls.append((request, cfg, http_client))
         if len(self.calls) == 1:
             raise LlmGatewayError("llm_timeout", "first call failed")
         self.started.set()
         await self.release.wait()
-        return self.result
+        return _response(self.result, cfg.provider)
 
 
 def _endpoint(name: str) -> LlmEndpointConfig:
@@ -134,6 +144,51 @@ async def test_first_matching_rule_selects_exactly_one_adapter() -> None:
     assert premium_adapter.calls == [(request, premium_endpoint, client)]
     assert secondary_adapter.calls == []
     assert default_adapter.calls == []
+
+
+async def test_complete_response_preserves_normalized_provider_result() -> None:
+    adapter = RecordingAdapter("normalized response")
+    router = LlmRouter(
+        (LlmRoute("selected", _endpoint("selected"), adapter),),
+        default_route="selected",
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await router.complete_response(_request(), http_client=client)
+
+    assert response == ChatCompletionResponse(
+        text="normalized response",
+        provider="selected",
+        model="selected-model",
+    )
+
+
+async def test_text_router_rejects_tool_only_response() -> None:
+    class ToolOnlyAdapter:
+        async def complete(
+            self,
+            request: ChatCompletionRequest,
+            *,
+            cfg: LlmEndpointConfig,
+            http_client: httpx.AsyncClient,
+        ) -> ChatCompletionResponse:
+            return ChatCompletionResponse(
+                text=None,
+                provider=cfg.provider,
+                model=cfg.model_name,
+                tool_calls=(ToolCall("call-1", "lookup"),),
+            )
+
+    router = LlmRouter(
+        (LlmRoute("selected", _endpoint("selected"), ToolOnlyAdapter()),),
+        default_route="selected",
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await router.complete(_request(), http_client=client)
+
+    assert exc_info.value.code == "llm_text_response_required"
 
 
 async def test_no_matching_rule_uses_default_route() -> None:
@@ -409,11 +464,11 @@ async def test_multiple_fallbacks_are_attempted_in_declared_order() -> None:
             *,
             cfg: LlmEndpointConfig,
             http_client: httpx.AsyncClient,
-        ) -> str:
+        ) -> ChatCompletionResponse:
             call_order.append(self.name)
             if isinstance(self.outcome, LlmGatewayError):
                 raise self.outcome
-            return self.outcome
+            return _response(self.outcome, cfg.provider)
 
     primary = OrderedAdapter("primary", LlmGatewayError("llm_timeout", "one"))
     first = OrderedAdapter("first", LlmGatewayError("llm_http_500", "two"))
