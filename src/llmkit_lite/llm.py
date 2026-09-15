@@ -48,6 +48,13 @@ class LlmCapability(StrEnum):
     REASONING_EFFORT = "reasoning_effort"
 
 
+class LlmResponseFormatType(StrEnum):
+    """Provider-independent structured response formats."""
+
+    JSON_OBJECT = "json_object"
+    JSON_SCHEMA = "json_schema"
+
+
 class LlmGatewayError(Exception):
     """Raised for LLM gateway failures.
 
@@ -131,6 +138,56 @@ class LlmCapabilities:
         """Return whether every requested capability is supported."""
 
         return not self.missing(required)
+
+
+@dataclass(frozen=True, slots=True)
+class LlmResponseFormat:
+    """Provider-independent request for a structured model response."""
+
+    kind: LlmResponseFormatType | str
+    name: str | None = None
+    schema: Mapping[str, JsonValue] | None = None
+    strict: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, LlmResponseFormatType):
+            try:
+                object.__setattr__(self, "kind", LlmResponseFormatType(self.kind))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"unsupported response format: {self.kind!r}") from exc
+        if not isinstance(self.strict, bool):
+            raise TypeError("response format strict must be a boolean")
+        if self.kind is LlmResponseFormatType.JSON_OBJECT:
+            if self.name is not None or self.schema is not None:
+                raise ValueError("JSON object response format cannot include a schema")
+            if self.strict:
+                raise ValueError("JSON object response format cannot be strict")
+            return
+        object.__setattr__(self, "name", _required_text(self.name, "schema name"))
+        if not isinstance(self.schema, Mapping):
+            raise TypeError("JSON schema response format requires a schema mapping")
+        frozen = _freeze_json(self.schema, "response format schema")
+        assert isinstance(frozen, Mapping)
+        object.__setattr__(self, "schema", frozen)
+
+    @classmethod
+    def json_object(cls) -> LlmResponseFormat:
+        return cls(kind=LlmResponseFormatType.JSON_OBJECT)
+
+    @classmethod
+    def json_schema(
+        cls,
+        *,
+        name: str,
+        schema: Mapping[str, JsonValue],
+        strict: bool = False,
+    ) -> LlmResponseFormat:
+        return cls(
+            kind=LlmResponseFormatType.JSON_SCHEMA,
+            name=name,
+            schema=schema,
+            strict=strict,
+        )
 
 
 def _freeze_json(value: Any, field_name: str) -> JsonValue:
@@ -352,7 +409,7 @@ class ChatCompletionRequest:
     max_tokens: int
     timeout_seconds: float
     temperature: float = 0
-    use_response_format: bool = True
+    response_format: LlmResponseFormat | None = None
     extra_body: Mapping[str, Any] | None = None
     routing_metadata: Mapping[str, str] = field(default_factory=dict)
     required_capabilities: Iterable[LlmCapability | str] = field(
@@ -392,11 +449,17 @@ class ChatCompletionRequest:
             or not 0 <= self.temperature <= 2
         ):
             raise ValueError("temperature must be between zero and two")
-        if not isinstance(self.use_response_format, bool):
-            raise TypeError("use_response_format must be a boolean")
+        if self.response_format is not None and not isinstance(
+            self.response_format, LlmResponseFormat
+        ):
+            raise TypeError("response_format must be an LlmResponseFormat or None")
         if self.extra_body is not None:
             if not isinstance(self.extra_body, Mapping):
                 raise TypeError("extra_body must be a mapping or None")
+            if "response_format" in self.extra_body:
+                raise ValueError(
+                    "extra_body cannot override the normalized response_format"
+                )
             frozen_extra = _freeze_json(self.extra_body, "extra_body")
             assert isinstance(frozen_extra, Mapping)
             object.__setattr__(
@@ -417,13 +480,18 @@ class ChatCompletionRequest:
             "routing_metadata",
             MappingProxyType(normalized_metadata),
         )
-        object.__setattr__(
-            self,
-            "required_capabilities",
+        required_capabilities = set(
             _normalize_capabilities(
                 self.required_capabilities,
                 "required capabilities",
-            ),
+            )
+        )
+        if self.response_format is not None:
+            required_capabilities.add(LlmCapability(self.response_format.kind.value))
+        object.__setattr__(
+            self,
+            "required_capabilities",
+            frozenset(required_capabilities),
         )
 
 
@@ -568,7 +636,7 @@ def chat_completion_body(
     cfg: LlmEndpointConfig,
     max_tokens: int,
     temperature: float = 0,
-    response_format: dict[str, str] | None = None,
+    response_format: LlmResponseFormat | None = None,
     extra_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a request body for an OpenAI-compatible chat completion."""
@@ -582,15 +650,34 @@ def chat_completion_body(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if response_format is not None:
-        body["response_format"] = dict(response_format)
     if cfg.reasoning_effort:
         body["reasoning_effort"] = cfg.reasoning_effort
     if extra_body:
         frozen_extra = _freeze_json(extra_body, "extra_body")
         assert isinstance(frozen_extra, Mapping)
+        if "response_format" in frozen_extra:
+            raise ValueError(
+                "extra_body cannot override the normalized response_format"
+            )
         body.update(_thaw_json(frozen_extra))
+    if response_format is not None:
+        body["response_format"] = _openai_response_format(response_format)
     return body
+
+
+def _openai_response_format(response_format: LlmResponseFormat) -> dict[str, Any]:
+    if response_format.kind is LlmResponseFormatType.JSON_OBJECT:
+        return {"type": "json_object"}
+    assert response_format.name is not None
+    assert response_format.schema is not None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": response_format.name,
+            "strict": response_format.strict,
+            "schema": _thaw_json(response_format.schema),
+        },
+    }
 
 
 def _parse_openai_tool_calls(value: Any) -> tuple[ToolCall, ...]:
@@ -674,29 +761,19 @@ class OpenAICompatibleAdapter:
         cfg: LlmEndpointConfig,
         http_client: httpx.AsyncClient,
     ) -> ChatCompletionResponse:
-        """Call an endpoint and normalize its response.
-
-        A single retry without `response_format` is attempted after HTTP 400
-        because several compatible gateways reject that parameter even when
-        they can still produce JSON.
-        """
+        """Call an endpoint and normalize its response."""
 
         require_capabilities(request, cfg)
         url = chat_completions_url(cfg.base_url)
 
-        def _body(with_response_format: bool) -> dict[str, Any]:
-            return chat_completion_body(
-                request.messages,
-                cfg=cfg,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                response_format=(
-                    {"type": "json_object"}
-                    if with_response_format and request.use_response_format
-                    else None
-                ),
-                extra_body=request.extra_body,
-            )
+        body = chat_completion_body(
+            request.messages,
+            cfg=cfg,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+            response_format=request.response_format,
+            extra_body=request.extra_body,
+        )
 
         attributes: dict[str, str | int | float] = {
             "gen_ai.operation.name": "chat",
@@ -716,21 +793,9 @@ class OpenAICompatibleAdapter:
                 resp = await http_client.post(
                     url,
                     headers=headers,
-                    json=_body(True),
+                    json=body,
                     timeout=request.timeout_seconds,
                 )
-                if resp.status_code == 400 and request.use_response_format:
-                    if span is not None:
-                        span.add_event(
-                            "llm.response_format_retry",
-                            {"http.response.status_code": 400},
-                        )
-                    resp = await http_client.post(
-                        url,
-                        headers=headers,
-                        json=_body(False),
-                        timeout=request.timeout_seconds,
-                    )
             except httpx.TimeoutException as exc:
                 elapsed = time.perf_counter() - start
                 logger.error("LLM gateway timed out after %.2fs", elapsed)
@@ -836,7 +901,7 @@ async def call_chat_completion_response(
     max_tokens: int,
     timeout_seconds: float,
     temperature: float = 0,
-    use_response_format: bool = True,
+    response_format: LlmResponseFormat | None = None,
     extra_body: Mapping[str, Any] | None = None,
     required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> ChatCompletionResponse:
@@ -847,7 +912,7 @@ async def call_chat_completion_response(
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         temperature=temperature,
-        use_response_format=use_response_format,
+        response_format=response_format,
         extra_body=extra_body,
         required_capabilities=required_capabilities,
     )
@@ -866,7 +931,7 @@ async def call_chat_completion(
     max_tokens: int,
     timeout_seconds: float,
     temperature: float = 0,
-    use_response_format: bool = True,
+    response_format: LlmResponseFormat | None = None,
     extra_body: Mapping[str, Any] | None = None,
     required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> str:
@@ -879,7 +944,7 @@ async def call_chat_completion(
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         temperature=temperature,
-        use_response_format=use_response_format,
+        response_format=response_format,
         extra_body=extra_body,
         required_capabilities=required_capabilities,
     )

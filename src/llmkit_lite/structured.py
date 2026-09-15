@@ -4,20 +4,76 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Generic, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from llmkit_lite.llm import (
+    ChatMessage,
     ChatMessageInput,
+    LlmCapabilities,
+    LlmCapability,
     LlmEndpointConfig,
+    LlmGatewayError,
+    LlmResponseFormat,
     call_chat_completion,
 )
 
 TModel = TypeVar("TModel", bound=BaseModel)
+
+
+class StructuredOutputPolicy(StrEnum):
+    """How strongly a structured call must be enforced by the provider."""
+
+    REQUIRE_JSON_SCHEMA = "require_json_schema"
+    REQUIRE_NATIVE = "require_native"
+    ALLOW_PROMPT_FALLBACK = "allow_prompt_fallback"
+
+
+class StructuredOutputStrategy(StrEnum):
+    """Concrete strategy selected from an endpoint's capabilities."""
+
+    JSON_SCHEMA = "json_schema"
+    JSON_OBJECT = "json_object"
+    PROMPT_ONLY = "prompt_only"
+
+
+def select_structured_output_strategy(
+    capabilities: LlmCapabilities,
+    policy: StructuredOutputPolicy | str = StructuredOutputPolicy.REQUIRE_NATIVE,
+) -> StructuredOutputStrategy:
+    """Select the strongest allowed strategy without contacting the provider."""
+
+    if not isinstance(capabilities, LlmCapabilities):
+        raise TypeError("capabilities must be an LlmCapabilities value")
+    try:
+        normalized_policy = StructuredOutputPolicy(policy)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported structured output policy: {policy!r}") from exc
+    if not capabilities.supports({LlmCapability.TEXT}):
+        raise LlmGatewayError(
+            "llm_capability_unsupported",
+            "structured output requires the text capability",
+        )
+    if capabilities.supports({LlmCapability.JSON_SCHEMA}):
+        return StructuredOutputStrategy.JSON_SCHEMA
+    if normalized_policy is StructuredOutputPolicy.REQUIRE_JSON_SCHEMA:
+        raise LlmGatewayError(
+            "llm_capability_unsupported",
+            "structured output requires the json_schema capability",
+        )
+    if capabilities.supports({LlmCapability.JSON_OBJECT}):
+        return StructuredOutputStrategy.JSON_OBJECT
+    if normalized_policy is StructuredOutputPolicy.ALLOW_PROMPT_FALLBACK:
+        return StructuredOutputStrategy.PROMPT_ONLY
+    raise LlmGatewayError(
+        "llm_capability_unsupported",
+        "native structured output requires json_schema or json_object capability",
+    )
 
 
 @dataclass(frozen=True)
@@ -128,22 +184,51 @@ async def structured_json_call(
     max_tokens: int,
     timeout_seconds: float,
     temperature: float = 0,
-    use_response_format: bool = True,
-    extra_body: dict[str, Any] | None = None,
+    policy: StructuredOutputPolicy | str = StructuredOutputPolicy.REQUIRE_NATIVE,
+    extra_body: Mapping[str, Any] | None = None,
 ) -> StructuredCallResult[TModel]:
     """Call an LLM and validate the response against a Pydantic model."""
 
+    strategy = select_structured_output_strategy(cfg.capabilities, policy)
+    schema = response_model.model_json_schema()
+    schema_text = json.dumps(schema, separators=(",", ":"), sort_keys=True)
+    structured_messages: tuple[ChatMessageInput, ...] = (
+        ChatMessage(
+            role="system",
+            content=(
+                "Return only a JSON object matching the following JSON Schema. "
+                "Do not include Markdown or commentary.\nJSON Schema:\n"
+                f"{schema_text}"
+            ),
+        ),
+        *messages,
+    )
+
+    response_format: LlmResponseFormat | None = None
+    if strategy is StructuredOutputStrategy.JSON_SCHEMA:
+        response_format = LlmResponseFormat.json_schema(
+            name=_response_schema_name(response_model),
+            schema=schema,
+        )
+    elif strategy is StructuredOutputStrategy.JSON_OBJECT:
+        response_format = LlmResponseFormat.json_object()
+
     content = await call_chat_completion(
-        messages,
+        structured_messages,
         cfg=cfg,
         http_client=http_client,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         temperature=temperature,
-        use_response_format=use_response_format,
+        response_format=response_format,
         extra_body=extra_body,
     )
     return parse_structured_json(content, response_model)
+
+
+def _response_schema_name(response_model: type[BaseModel]) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_-]", "_", response_model.__name__)
+    return (normalized.strip("_") or "structured_response")[:64]
 
 
 def clamp_float(value: object, *, minimum: float = 0.0, maximum: float = 1.0) -> float:

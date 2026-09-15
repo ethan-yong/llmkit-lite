@@ -256,9 +256,15 @@ is available to predicates but is not sent to providers or recorded in telemetry
 
 ## Structured Outputs
 
+Structured calls choose the strongest format declared by the endpoint:
+`json_schema`, then `json_object`. Native enforcement is required by default,
+so an incompatible endpoint fails before a network request instead of silently
+weakening the request.
+
 ```python
 from pydantic import BaseModel, Field
 
+from llmkit_lite.llm import LlmCapabilities, LlmEndpointConfig
 from llmkit_lite.structured import structured_json_call
 
 
@@ -267,6 +273,12 @@ class Classification(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+cfg = LlmEndpointConfig(
+    provider="vllm",
+    base_url="http://127.0.0.1:8000",
+    model_name="structured-model",
+    capabilities=LlmCapabilities({"text", "json_schema", "json_object"}),
+)
 result = await structured_json_call(
     messages,
     response_model=Classification,
@@ -279,6 +291,29 @@ result = await structured_json_call(
 if result.ok:
     classification = result.value
 ```
+
+The helper derives the provider request schema from the Pydantic model and
+still validates the returned JSON locally. To deliberately support a text-only
+endpoint, opt in to prompt-based fallback:
+
+```python
+from llmkit_lite.structured import StructuredOutputPolicy
+
+
+result = await structured_json_call(
+    messages,
+    response_model=Classification,
+    cfg=text_only_cfg,
+    http_client=client,
+    max_tokens=200,
+    timeout_seconds=10,
+    policy=StructuredOutputPolicy.ALLOW_PROMPT_FALLBACK,
+)
+```
+
+Use `StructuredOutputPolicy.REQUIRE_JSON_SCHEMA` when JSON object mode is not
+strong enough. Provider errors are surfaced directly; the adapter does not
+retry by dropping the requested format.
 
 ## FastAPI Helpers
 

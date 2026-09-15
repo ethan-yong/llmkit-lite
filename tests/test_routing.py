@@ -875,7 +875,7 @@ async def test_unexpected_errors_and_cancellation_are_not_retried() -> None:
         assert fallback.calls == []
 
 
-async def test_response_format_compatibility_retry_is_not_a_router_retry(
+async def test_provider_http_400_uses_router_retry_policy(
     in_memory_tracing,
 ) -> None:
     http_calls = 0
@@ -904,7 +904,7 @@ async def test_response_format_compatibility_retry_is_not_a_router_retry(
     )
     assert result == "ok"
     assert http_calls == 2
-    assert "llm.route_retry" not in [event.name for event in router_span.events]
+    assert "llm.route_retry" in [event.name for event in router_span.events]
 
 
 async def test_routing_telemetry_excludes_sensitive_values(in_memory_tracing) -> None:

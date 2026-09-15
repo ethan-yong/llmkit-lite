@@ -25,7 +25,8 @@ async def test_fastapi_tracing_gateway_and_structured_output_compose(
 ) -> None:
     def llm_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        assert body["messages"][0]["content"] == "Classify: hello"
+        assert body["messages"][1]["content"] == "Classify: hello"
+        assert body["response_format"] == {"type": "json_object"}
         return httpx.Response(
             200,
             content=_chat_content('{"label":"greeting","confidence":0.97}'),
@@ -40,6 +41,7 @@ async def test_fastapi_tracing_gateway_and_structured_output_compose(
         provider="local",
         base_url="https://gateway.example.com",
         model_name="test-model",
+        capabilities={"text", "json_object"},
     )
 
     @app.get("/classify")

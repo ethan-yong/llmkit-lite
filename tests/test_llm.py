@@ -13,6 +13,7 @@ from llmkit_lite.llm import (
     LlmCapability,
     LlmEndpointConfig,
     LlmGatewayError,
+    LlmResponseFormat,
     OpenAICompatibleAdapter,
     TokenUsage,
     ToolCall,
@@ -81,6 +82,32 @@ def test_endpoint_and_request_normalize_declared_capabilities() -> None:
         LlmCapability.TOOL_CALLING,
     }
     assert isinstance(request.required_capabilities, frozenset)
+
+
+def test_given_response_format_when_building_request_then_capability_is_required(
+) -> None:
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "return JSON"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        response_format=LlmResponseFormat.json_object(),
+    )
+
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.JSON_OBJECT,
+    }
+
+
+def test_given_response_format_in_extra_body_when_building_request_then_rejected(
+) -> None:
+    with pytest.raises(ValueError, match="cannot override"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "return JSON"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            extra_body={"response_format": {"type": "json_object"}},
+        )
 
 
 def test_resolve_llm_config_local_default() -> None:
@@ -172,7 +199,7 @@ def test_chat_completion_body() -> None:
         cfg=_cfg(reasoning_effort="medium"),
         max_tokens=50,
         temperature=0.2,
-        response_format={"type": "json_object"},
+        response_format=LlmResponseFormat.json_object(),
         extra_body={"seed": 123},
     )
     assert body == {
@@ -183,6 +210,34 @@ def test_chat_completion_body() -> None:
         "response_format": {"type": "json_object"},
         "reasoning_effort": "medium",
         "seed": 123,
+    }
+
+
+def test_given_json_schema_format_when_building_body_then_openai_shape_is_used(
+) -> None:
+    body = chat_completion_body(
+        [{"role": "user", "content": "return JSON"}],
+        cfg=_cfg(),
+        max_tokens=50,
+        response_format=LlmResponseFormat.json_schema(
+            name="demo_output",
+            schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+            },
+        ),
+    )
+
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "demo_output",
+            "strict": False,
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+            },
+        },
     }
 
 
@@ -222,7 +277,7 @@ async def test_call_chat_completion_success() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["model"] == "test-model"
-        assert body["response_format"] == {"type": "json_object"}
+        assert "response_format" not in body
         return httpx.Response(200, content=_chat_content('{"ok": true}'))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -539,37 +594,29 @@ async def test_call_chat_completion_creates_safe_client_span(
     assert "private-api-key" not in exported
 
 
-async def test_call_chat_completion_retries_without_response_format_on_400(
-    in_memory_tracing,
+async def test_given_native_format_error_when_calling_then_format_is_not_downgraded(
 ) -> None:
     calls: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         calls.append(body)
-        if "response_format" in body:
-            return httpx.Response(400, json={"error": "unsupported"})
-        return httpx.Response(200, content=_chat_content('{"ok": true}'))
+        return httpx.Response(400, json={"error": "unsupported"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        content = await call_chat_completion(
-            [{"role": "user", "content": "hi"}],
-            cfg=_cfg(),
-            http_client=client,
-            max_tokens=100,
-            timeout_seconds=5,
-        )
-    assert content == '{"ok": true}'
-    assert len(calls) == 2
-    assert "response_format" not in calls[1]
-    llm_span = next(
-        span
-        for span in in_memory_tracing.get_finished_spans()
-        if span.name == "llm.chat_completion"
-    )
-    assert [event.name for event in llm_span.events] == [
-        "llm.response_format_retry"
-    ]
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion(
+                [{"role": "user", "content": "hi"}],
+                cfg=_cfg(capabilities={"text", "json_object"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                response_format=LlmResponseFormat.json_object(),
+            )
+
+    assert exc_info.value.code == "llm_http_400"
+    assert len(calls) == 1
+    assert calls[0]["response_format"] == {"type": "json_object"}
 
 
 async def test_call_chat_completion_timeout_raises(in_memory_tracing) -> None:
