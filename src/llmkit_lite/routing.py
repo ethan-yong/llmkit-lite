@@ -20,6 +20,7 @@ from llmkit_lite.llm import (
     LlmGatewayError,
     LlmProviderAdapter,
     OpenAICompatibleAdapter,
+    missing_capabilities,
 )
 from llmkit_lite.observability import set_span_error, trace_span
 
@@ -360,11 +361,35 @@ class LlmRouter:
             _add_event(span, "llm.route_selected", _route_attributes(primary))
             last_error: LlmGatewayError | None = None
             attempted_any = False
+            compatible_any = False
             previous_route = primary.name
             previous_error_type = "llm_circuit_open"
 
             for index, route_name in enumerate(candidate_names):
                 route = self._routes[route_name]
+                missing = missing_capabilities(request, route.endpoint)
+                if missing:
+                    missing_names = ",".join(
+                        sorted(capability.value for capability in missing)
+                    )
+                    logger.info(
+                        "Skipping incompatible LLM route %s (missing=%s)",
+                        route.name,
+                        missing_names,
+                    )
+                    _add_event(
+                        span,
+                        "llm.route_incompatible",
+                        {
+                            **_route_attributes(route),
+                            "llmkit.capability.missing": missing_names,
+                        },
+                    )
+                    previous_route = route.name
+                    previous_error_type = "llm_capability_unsupported"
+                    continue
+
+                compatible_any = True
                 circuit = self._circuits[route_name]
                 allowed, is_probe = await circuit.acquire(
                     now=self._clock(),
@@ -449,10 +474,16 @@ class LlmRouter:
                 raise error from last_error
 
             assert not attempted_any
-            error = LlmGatewayError(
-                "llm_routes_unavailable",
-                "all configured LLM route circuits are open",
-            )
+            if compatible_any:
+                error = LlmGatewayError(
+                    "llm_routes_unavailable",
+                    "all compatible LLM route circuits are open",
+                )
+            else:
+                error = LlmGatewayError(
+                    "llm_capabilities_unavailable",
+                    "no configured LLM route supports the required capabilities",
+                )
             if span is not None:
                 span.set_attribute("error.type", error.code)
                 set_span_error(span, error.code)

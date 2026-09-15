@@ -3,6 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from llmkit_lite.llm import LlmCapability
 from llmkit_lite.settings import (
     DashboardSettings,
     LlmSettings,
@@ -18,6 +19,7 @@ def test_given_no_saved_file_when_loading_then_defaults_are_returned(tmp_path) -
 
     assert settings.llm.provider == "local"
     assert settings.llm.model_name == "qwen2.5"
+    assert settings.llm.capabilities == {LlmCapability.TEXT}
     assert settings.generation.max_tokens == 600
     assert settings.workflow.heartbeat_interval_seconds == 10
 
@@ -115,7 +117,9 @@ def test_given_invalid_relationships_when_validating_then_settings_are_rejected(
 
 
 def test_given_dashboard_settings_when_resolving_then_runtime_models_match() -> None:
-    settings = DashboardSettings()
+    settings = DashboardSettings(
+        llm=LlmSettings(capabilities={"text", "tool_calling"})
+    )
 
     endpoint = settings.to_llm_config()
     resilience = settings.to_resilience_policy()
@@ -123,6 +127,10 @@ def test_given_dashboard_settings_when_resolving_then_runtime_models_match() -> 
 
     assert endpoint.base_url == settings.llm.base_url
     assert endpoint.model_name == settings.llm.model_name
+    assert endpoint.capabilities.supported == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
     assert resilience.max_attempts_per_route == 2
     assert tracing.service_name == "llmkit-lite"
     assert tracing.environment == "development"

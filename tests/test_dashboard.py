@@ -1,6 +1,7 @@
 import httpx
 
 from llmkit_lite.dashboard import create_settings_app
+from llmkit_lite.llm import LlmCapability
 from llmkit_lite.settings import DashboardSettings, LlmSettings, SettingsStore
 
 
@@ -56,6 +57,7 @@ async def test_given_valid_form_when_saving_then_settings_are_persisted(
             "base_url": "https://api.deepseek.com/v1",
             "model_name": "deepseek-chat",
             "api_key": "private-secret",
+            "capabilities": ["text", "tool_calling"],
         }
     )
 
@@ -66,6 +68,10 @@ async def test_given_valid_form_when_saving_then_settings_are_persisted(
     assert "private-secret" not in response.text
     assert store.load().llm.api_key == "private-secret"
     assert store.load().llm.model_name == "deepseek-chat"
+    assert store.load().llm.capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
 
 
 async def test_given_invalid_form_when_saving_then_field_errors_are_safe(

@@ -9,6 +9,8 @@ from llmkit_lite.llm import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    LlmCapabilities,
+    LlmCapability,
     LlmEndpointConfig,
     LlmGatewayError,
     OpenAICompatibleAdapter,
@@ -40,6 +42,45 @@ def _cfg(**overrides: object) -> LlmEndpointConfig:
     }
     defaults.update(overrides)
     return LlmEndpointConfig(**defaults)  # type: ignore[arg-type]
+
+
+def test_capabilities_normalize_strings_and_report_missing_requirements() -> None:
+    capabilities = LlmCapabilities({"vision", LlmCapability.TEXT})
+
+    assert capabilities.supported == {
+        LlmCapability.TEXT,
+        LlmCapability.VISION,
+    }
+    assert capabilities.supports({"text"})
+    assert capabilities.missing({"text", "tool_calling"}) == {
+        LlmCapability.TOOL_CALLING
+    }
+    assert isinstance(capabilities.supported, frozenset)
+
+
+def test_unknown_capability_is_rejected_during_configuration() -> None:
+    with pytest.raises(ValueError, match="unsupported LLM capability"):
+        LlmCapabilities({"telepathy"})
+
+
+def test_endpoint_and_request_normalize_declared_capabilities() -> None:
+    endpoint = _cfg(capabilities={"text", "tool_calling"})
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "inspect router"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        required_capabilities={"tool_calling", LlmCapability.TEXT},
+    )
+
+    assert endpoint.capabilities.supported == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+    assert isinstance(request.required_capabilities, frozenset)
 
 
 def test_resolve_llm_config_local_default() -> None:
@@ -195,10 +236,57 @@ async def test_call_chat_completion_success() -> None:
     assert content == '{"ok": true}'
 
 
+async def test_compatible_capability_request_reaches_provider() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("done"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "inspect router"}],
+            cfg=_cfg(capabilities={"text", "tool_calling"}),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+            required_capabilities={"tool_calling"},
+        )
+
+    assert response.text == "done"
+    assert calls == 1
+
+
+async def test_incompatible_capability_request_never_reaches_provider() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("must not run"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(capabilities={"text"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                required_capabilities={"tool_calling"},
+            )
+
+    assert exc_info.value.code == "llm_capability_unsupported"
+    assert "tool_calling" in exc_info.value.detail
+    assert calls == 0
+
+
 async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "routing_metadata" not in body
+        assert "required_capabilities" not in body
         assert "private-value" not in request.content.decode()
         return httpx.Response(200, content=_chat_content("done"))
 

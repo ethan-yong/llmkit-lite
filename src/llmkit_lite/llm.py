@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
@@ -33,6 +34,18 @@ JsonValue = (
 )
 
 _DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+
+class LlmCapability(StrEnum):
+    """One optional behavior an endpoint can support."""
+
+    TEXT = "text"
+    TOOL_CALLING = "tool_calling"
+    JSON_OBJECT = "json_object"
+    JSON_SCHEMA = "json_schema"
+    VISION = "vision"
+    STREAMING = "streaming"
+    REASONING_EFFORT = "reasoning_effort"
 
 
 class LlmGatewayError(Exception):
@@ -62,6 +75,62 @@ def _optional_text(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
     return _required_text(value, field_name)
+
+
+def _normalize_capabilities(
+    values: Iterable[LlmCapability | str],
+    field_name: str,
+) -> frozenset[LlmCapability]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        raise TypeError(f"{field_name} must be an iterable of capabilities")
+    normalized: set[LlmCapability] = set()
+    for value in values:
+        if isinstance(value, LlmCapability):
+            normalized.add(value)
+            continue
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{field_name} must contain strings or LlmCapability values"
+            )
+        capability_name = _required_text(value, "capability name")
+        try:
+            normalized.add(LlmCapability(capability_name))
+        except ValueError as exc:
+            raise ValueError(
+                f"unsupported LLM capability: {capability_name!r}"
+            ) from exc
+    return frozenset(normalized)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class LlmCapabilities:
+    """Immutable capabilities declared by one configured model endpoint."""
+
+    supported: frozenset[LlmCapability]
+
+    def __init__(
+        self,
+        supported: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
+    ) -> None:
+        object.__setattr__(
+            self,
+            "supported",
+            _normalize_capabilities(supported, "supported capabilities"),
+        )
+
+    def missing(
+        self,
+        required: Iterable[LlmCapability | str],
+    ) -> frozenset[LlmCapability]:
+        """Return requirements not supported by this endpoint."""
+
+        normalized = _normalize_capabilities(required, "required capabilities")
+        return normalized.difference(self.supported)
+
+    def supports(self, required: Iterable[LlmCapability | str]) -> bool:
+        """Return whether every requested capability is supported."""
+
+        return not self.missing(required)
 
 
 def _freeze_json(value: Any, field_name: str) -> JsonValue:
@@ -268,6 +337,11 @@ class LlmEndpointConfig:
     model_name: str
     api_key: str | None = None
     reasoning_effort: str | None = None
+    capabilities: LlmCapabilities = field(default_factory=LlmCapabilities)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capabilities, LlmCapabilities):
+            object.__setattr__(self, "capabilities", LlmCapabilities(self.capabilities))
 
 
 @dataclass(frozen=True)
@@ -281,6 +355,9 @@ class ChatCompletionRequest:
     use_response_format: bool = True
     extra_body: Mapping[str, Any] | None = None
     routing_metadata: Mapping[str, str] = field(default_factory=dict)
+    required_capabilities: Iterable[LlmCapability | str] = field(
+        default_factory=lambda: frozenset({LlmCapability.TEXT})
+    )
 
     def __post_init__(self) -> None:
         if isinstance(self.messages, (str, bytes)) or not isinstance(
@@ -340,6 +417,43 @@ class ChatCompletionRequest:
             "routing_metadata",
             MappingProxyType(normalized_metadata),
         )
+        object.__setattr__(
+            self,
+            "required_capabilities",
+            _normalize_capabilities(
+                self.required_capabilities,
+                "required capabilities",
+            ),
+        )
+
+
+def missing_capabilities(
+    request: ChatCompletionRequest,
+    cfg: LlmEndpointConfig,
+) -> frozenset[LlmCapability]:
+    """Return capabilities required by the request but absent from the endpoint."""
+
+    if not isinstance(request, ChatCompletionRequest):
+        raise TypeError("request must be a ChatCompletionRequest")
+    if not isinstance(cfg, LlmEndpointConfig):
+        raise TypeError("cfg must be an LlmEndpointConfig")
+    return cfg.capabilities.missing(request.required_capabilities)
+
+
+def require_capabilities(
+    request: ChatCompletionRequest,
+    cfg: LlmEndpointConfig,
+) -> None:
+    """Reject an incompatible endpoint before provider execution."""
+
+    missing = missing_capabilities(request, cfg)
+    if not missing:
+        return
+    names = ", ".join(sorted(capability.value for capability in missing))
+    raise LlmGatewayError(
+        "llm_capability_unsupported",
+        f"LLM endpoint does not support required capabilities: {names}",
+    )
 
 
 class LlmProviderAdapter(Protocol):
@@ -567,6 +681,7 @@ class OpenAICompatibleAdapter:
         they can still produce JSON.
         """
 
+        require_capabilities(request, cfg)
         url = chat_completions_url(cfg.base_url)
 
         def _body(with_response_format: bool) -> dict[str, Any]:
@@ -723,6 +838,7 @@ async def call_chat_completion_response(
     temperature: float = 0,
     use_response_format: bool = True,
     extra_body: Mapping[str, Any] | None = None,
+    required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> ChatCompletionResponse:
     """Call an endpoint once and return its normalized provider response."""
 
@@ -733,6 +849,7 @@ async def call_chat_completion_response(
         temperature=temperature,
         use_response_format=use_response_format,
         extra_body=extra_body,
+        required_capabilities=required_capabilities,
     )
     return await _OPENAI_COMPATIBLE_ADAPTER.complete(
         request,
@@ -751,6 +868,7 @@ async def call_chat_completion(
     temperature: float = 0,
     use_response_format: bool = True,
     extra_body: Mapping[str, Any] | None = None,
+    required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> str:
     """Call an endpoint once and return text for compatibility-oriented callers."""
 
@@ -763,6 +881,7 @@ async def call_chat_completion(
         temperature=temperature,
         use_response_format=use_response_format,
         extra_body=extra_body,
+        required_capabilities=required_capabilities,
     )
     if response.text is None:
         raise LlmGatewayError(

@@ -138,6 +138,40 @@ async def inspect_router() -> ChatCompletionResponse:
 `llm_text_response_required` when a valid response contains tool calls but no
 text, so callers do not silently discard the requested action.
 
+### Capability negotiation
+
+Declare model capabilities on each endpoint and requirements on each request.
+Incompatible requests are rejected before network execution:
+
+```python
+from llmkit_lite.llm import (
+    ChatCompletionRequest,
+    LlmCapabilities,
+    LlmEndpointConfig,
+)
+
+
+endpoint = LlmEndpointConfig(
+    provider="vllm",
+    base_url="http://127.0.0.1:8000",
+    model_name="tool-model",
+    capabilities=LlmCapabilities({"text", "tool_calling", "json_object"}),
+)
+request = ChatCompletionRequest(
+    messages=[{"role": "user", "content": "Inspect router 42"}],
+    max_tokens=300,
+    timeout_seconds=20,
+    required_capabilities={"text", "tool_calling"},
+)
+```
+
+The default endpoint and request capability is `text`, preserving existing
+text-only integrations. A direct incompatible call raises
+`llm_capability_unsupported`. The router skips incompatible candidates and
+tries declared fallbacks; if none support the request, it raises
+`llm_capabilities_unavailable`. Capability incompatibility does not consume
+retries or count as a circuit-breaker failure.
+
 ## Resilient Provider Routing
 
 Use `LlmRouter` when an application needs to select between providers, retry

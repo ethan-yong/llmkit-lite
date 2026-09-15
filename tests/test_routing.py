@@ -6,6 +6,7 @@ import pytest
 from llmkit_lite.llm import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    LlmCapabilities,
     LlmEndpointConfig,
     LlmGatewayError,
     ToolCall,
@@ -97,20 +98,36 @@ class BlockingProbeAdapter(RecordingAdapter):
         return _response(self.result, cfg.provider)
 
 
-def _endpoint(name: str) -> LlmEndpointConfig:
+def _endpoint(
+    name: str,
+    *,
+    capabilities: set[str] | None = None,
+) -> LlmEndpointConfig:
     return LlmEndpointConfig(
         provider=name,
         base_url=f"https://{name}.example.com",
         model_name=f"{name}-model",
+        capabilities=LlmCapabilities(
+            capabilities if capabilities is not None else {"text"}
+        ),
     )
 
 
-def _request(**metadata: str) -> ChatCompletionRequest:
+def _request(
+    *,
+    required_capabilities: set[str] | None = None,
+    **metadata: str,
+) -> ChatCompletionRequest:
     return ChatCompletionRequest(
         messages=[{"role": "user", "content": "route this"}],
         max_tokens=100,
         timeout_seconds=5,
         routing_metadata=metadata,
+        required_capabilities=(
+            required_capabilities
+            if required_capabilities is not None
+            else {"text"}
+        ),
     )
 
 
@@ -592,6 +609,103 @@ async def test_all_failed_routes_raise_safe_exhausted_error() -> None:
     assert exc_info.value.detail == "all eligible LLM routes failed"
     assert exc_info.value.__cause__ is final_error
     assert "private" not in str(exc_info.value)
+
+
+async def test_incompatible_primary_uses_capable_fallback(in_memory_tracing) -> None:
+    primary = RecordingAdapter("must not run")
+    fallback = RecordingAdapter("tool-capable response")
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "primary",
+                _endpoint("primary"),
+                primary,
+                fallback_routes=("fallback",),
+            ),
+            LlmRoute(
+                "fallback",
+                _endpoint(
+                    "fallback",
+                    capabilities={"text", "tool_calling"},
+                ),
+                fallback,
+            ),
+        ),
+        default_route="primary",
+    )
+    request = _request(required_capabilities={"text", "tool_calling"})
+
+    async with httpx.AsyncClient() as client:
+        response = await router.complete_response(request, http_client=client)
+
+    assert response.text == "tool-capable response"
+    assert primary.calls == []
+    assert len(fallback.calls) == 1
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.router.complete"
+    )
+    events = {event.name: event for event in span.events}
+    assert events["llm.route_incompatible"].attributes[
+        "llmkit.capability.missing"
+    ] == "tool_calling"
+    assert events["llm.route_fallback"].attributes["error.type"] == (
+        "llm_capability_unsupported"
+    )
+    exported = str(span.attributes) + str(span.events)
+    assert "route this" not in exported
+
+
+async def test_all_incompatible_routes_raise_capability_error_without_calls() -> None:
+    primary = RecordingAdapter("must not run")
+    fallback = RecordingAdapter("must not run")
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "primary",
+                _endpoint("primary"),
+                primary,
+                fallback_routes=("fallback",),
+            ),
+            LlmRoute("fallback", _endpoint("fallback"), fallback),
+        ),
+        default_route="primary",
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await router.complete(
+                _request(required_capabilities={"vision"}),
+                http_client=client,
+            )
+
+    assert exc_info.value.code == "llm_capabilities_unavailable"
+    assert primary.calls == []
+    assert fallback.calls == []
+
+
+async def test_incompatible_requests_do_not_open_route_circuit() -> None:
+    adapter = RecordingAdapter("available")
+    router = LlmRouter(
+        (LlmRoute("default", _endpoint("default"), adapter),),
+        default_route="default",
+        resilience_policy=LlmResiliencePolicy(circuit_failure_threshold=1),
+    )
+
+    async with httpx.AsyncClient() as client:
+        for _ in range(3):
+            with pytest.raises(LlmGatewayError) as exc_info:
+                await router.complete(
+                    _request(required_capabilities={"vision"}),
+                    http_client=client,
+                )
+            assert exc_info.value.code == "llm_capabilities_unavailable"
+
+        result = await router.complete(_request(), http_client=client)
+
+    assert result == "available"
+    assert len(adapter.calls) == 1
 
 
 async def test_circuit_opens_after_three_exhausted_route_calls() -> None:

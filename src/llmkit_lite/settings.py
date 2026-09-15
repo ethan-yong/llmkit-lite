@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from llmkit_lite.llm import LlmEndpointConfig
+from llmkit_lite.llm import LlmCapabilities, LlmCapability, LlmEndpointConfig
 from llmkit_lite.observability import TracingSettings
 from llmkit_lite.routing import LlmResiliencePolicy
 
@@ -47,6 +47,9 @@ class LlmSettings(_SettingsModel):
     model_name: str = "qwen2.5"
     api_key: str | None = Field(default=None, repr=False)
     reasoning_effort: str | None = None
+    capabilities: set[LlmCapability] = Field(
+        default_factory=lambda: {LlmCapability.TEXT}
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -163,6 +166,7 @@ class DashboardSettings(_SettingsModel):
             model_name=self.llm.model_name,
             api_key=self.llm.api_key,
             reasoning_effort=self.llm.reasoning_effort,
+            capabilities=LlmCapabilities(self.llm.capabilities),
         )
 
     def to_resilience_policy(self) -> LlmResiliencePolicy:
