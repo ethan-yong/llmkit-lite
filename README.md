@@ -32,8 +32,50 @@ uv add "llmkit-lite[mcp]"
 ## Configuration
 
 `llmkit-lite` targets OpenAI-compatible chat completion gateways. It supports
-local/vLLM/LiteLLM-style services and DeepSeek-style hosted APIs through
-environment variables:
+local/vLLM/LiteLLM-style services and DeepSeek-style hosted APIs.
+
+### Settings dashboard
+
+Start the local settings dashboard:
+
+```powershell
+uv run llmkit-lite settings
+```
+
+The command opens `http://127.0.0.1:8765/`. Use the browser to configure the
+provider, model, API key, generation defaults, retry and circuit-breaker policy,
+tracing, logging, and workflow-recovery timing. Settings are saved atomically to
+`.llmkit/settings.json`; this directory is ignored by Git because it may contain
+credentials. Saved keys are never returned to the browser after storage.
+
+The dashboard is local-only by default. An existing FastAPI service can expose
+the same interface at a private route:
+
+```python
+from fastapi import FastAPI
+
+from llmkit_lite.dashboard import create_settings_app
+from llmkit_lite.settings import SettingsStore
+
+
+app = FastAPI()
+settings_store = SettingsStore()
+app.mount("/settings", create_settings_app(settings_store))
+
+# Load validated values when constructing application dependencies.
+settings = settings_store.load()
+llm_config = settings.to_llm_config()
+resilience_policy = settings.to_resilience_policy()
+tracing_settings = settings.to_tracing_settings()
+```
+
+Running workers may need a restart after settings change because live dependency
+replacement is application-specific.
+
+### Environment variables
+
+Environment-based configuration remains available for small deployments and
+automation:
 
 ```text
 LLM_PROVIDER=local

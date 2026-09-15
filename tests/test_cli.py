@@ -1,5 +1,6 @@
 import json
 
+import uvicorn
 from typer.testing import CliRunner
 
 from llmkit_lite.cli import app
@@ -11,6 +12,37 @@ def test_cli_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "Utilities for production LLM services" in result.output
+
+
+def test_settings_command_starts_dashboard_without_opening_browser(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def run(app, **kwargs) -> None:
+        calls.append((app, kwargs))
+
+    monkeypatch.setattr(uvicorn, "run", run)
+
+    result = runner.invoke(
+        app,
+        [
+            "settings",
+            "--settings-file",
+            str(tmp_path / "settings.json"),
+            "--no-open-browser",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "http://127.0.0.1:8765/" in result.output
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "host": "127.0.0.1",
+        "port": 8765,
+        "log_level": "warning",
+    }
 
 
 def test_inspect_llm_prints_config_without_network() -> None:
