@@ -640,7 +640,7 @@ observations also preserve the current status instead of assuming failure.
 for MCP calls. Durable workflow protection comes from `DurableOperationExecutor`
 and requires a `StateStore` implementation that survives process restarts.
 
-### Atomic worker lease acquisition
+### Renewable fenced worker leases
 
 Use a lease when multiple workers may receive the same durable operation. The
 store performs the ownership decision atomically, so two workers cannot both
@@ -659,20 +659,39 @@ lease_manager = LeaseManager(
 claim = await lease_manager.acquire("reboot-789", "worker-42")
 
 if claim.owns_lease:
-    # This worker may begin processing the operation.
-    ...
+    lease = claim.lease
+    lease = await lease_manager.renew(
+        lease.operation_id,
+        lease.owner_id,
+        lease.fencing_token,
+    )
+    await lease_manager.assert_owned(
+        lease.operation_id,
+        lease.owner_id,
+        lease.fencing_token,
+    )
 ```
 
 An absent or expired lease is acquired with a new revision. A retry by the
 current owner returns `already_owned` without extending the expiry, while a
 different worker receives `held_by_other`. At the exact expiration time the
-lease is eligible for takeover. The revision records persistence changes only;
-fencing-token enforcement and heartbeat renewal are separate concerns.
+lease is eligible for takeover.
+
+`renew()` is the worker heartbeat. It extends an unexpired lease only when both
+the owner and fencing token still match. A renewal advances the storage
+revision but keeps the fencing token unchanged. An expired-lease takeover
+advances both values, so the previous worker can no longer renew or validate
+its ownership.
+
+Call `assert_owned()` before guarded local work, and pass `fencing_token` to
+every protected database or downstream write. That resource must persist the
+highest token it has accepted and reject lower tokens; a lease check by itself
+cannot stop a worker that pauses after checking and resumes after takeover.
 
 `InMemoryLeaseStore` is suitable for tests and local development but cannot
 coordinate separate processes or survive restarts. A production `LeaseStore`
-must implement `acquire_lease()` as one atomic database operation rather than a
-read followed by a write.
+must implement acquisition, renewal, and validation as atomic database
+operations rather than read-then-write sequences.
 
 ## Evaluations
 
