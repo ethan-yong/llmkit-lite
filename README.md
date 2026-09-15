@@ -640,6 +640,113 @@ observations also preserve the current status instead of assuming failure.
 for MCP calls. Durable workflow protection comes from `DurableOperationExecutor`
 and requires a `StateStore` implementation that survives process restarts.
 
+### Renewable fenced worker leases
+
+Use a lease when multiple workers may receive the same durable operation. The
+store performs the ownership decision atomically, so two workers cannot both
+acquire the same unexpired lease:
+
+```python
+from datetime import timedelta
+
+from llmkit_lite.leases import InMemoryLeaseStore, LeaseManager
+
+
+lease_manager = LeaseManager(
+    InMemoryLeaseStore(),
+    lease_duration=timedelta(seconds=30),
+)
+claim = await lease_manager.acquire("reboot-789", "worker-42")
+
+if claim.owns_lease:
+    lease = claim.lease
+    lease = await lease_manager.renew(
+        lease.operation_id,
+        lease.owner_id,
+        lease.fencing_token,
+    )
+    await lease_manager.assert_owned(
+        lease.operation_id,
+        lease.owner_id,
+        lease.fencing_token,
+    )
+```
+
+An absent or expired lease is acquired with a new revision. A retry by the
+current owner returns `already_owned` without extending the expiry, while a
+different worker receives `held_by_other`. At the exact expiration time the
+lease is eligible for takeover.
+
+`renew()` is the worker heartbeat. It extends an unexpired lease only when both
+the owner and fencing token still match. A renewal advances the storage
+revision but keeps the fencing token unchanged. An expired-lease takeover
+advances both values, so the previous worker can no longer renew or validate
+its ownership.
+
+Call `assert_owned()` before guarded local work, and pass `fencing_token` to
+every protected database or downstream write. That resource must persist the
+highest token it has accepted and reject lower tokens; a lease check by itself
+cannot stop a worker that pauses after checking and resumes after takeover.
+
+`InMemoryLeaseStore` is suitable for tests and local development but cannot
+coordinate separate processes or survive restarts. A production `LeaseStore`
+must implement acquisition, renewal, and validation as atomic database
+operations rather than read-then-write sequences.
+
+### Queue redelivery and worker recovery
+
+A visibility queue prevents a worker crash from permanently losing an
+operation. Receiving a message hides it temporarily. The worker acknowledges
+the message only after the operation reaches `completed` or `failed`; otherwise
+the message becomes visible again when its deadline expires:
+
+```python
+from llmkit_lite.queueing import InMemoryOperationQueue, OperationJob
+from llmkit_lite.recovery import DurableOperationHandler, RecoveryWorker
+
+
+queue = InMemoryOperationQueue()
+await queue.publish(
+    OperationJob(
+        "reboot-789",
+        identity,
+        "reboot-key-789",
+        request,
+    )
+)
+
+worker = RecoveryWorker(
+    queue,
+    lease_manager,
+    DurableOperationHandler(executor),
+    worker_id="worker-42",
+)
+result = await worker.run_once()
+```
+
+`run_once()` intentionally handles at most one visible message; applications
+retain control of polling, shutdown, backoff, and deployment. If another worker
+holds the lease, or execution remains uncertain or in progress, the delivery
+is left unacknowledged for a later attempt. A crash or cancellation follows the
+same rule automatically because acknowledgement happens last.
+
+On redelivery, the replacement worker takes over the expired lease and
+`DurableOperationExecutor` reads the stored operation. A `dispatching` or
+`in_progress` operation is inspected rather than sent again, while a stored
+terminal result is reused and acknowledged.
+
+Long-running custom handlers receive a `RecoveryContext`. Calling
+`await context.heartbeat()` renews the operation lease first and then extends
+queue visibility. Protected resource writes must still receive
+`context.fencing_token` and reject tokens older than the highest one previously
+accepted. Queue receipt tokens separately prevent an old delivery from
+acknowledging a newer redelivery.
+
+`InMemoryOperationQueue` is a deterministic reference implementation, not a
+durable production broker. Implement the `OperationQueue` protocol for SQS,
+RabbitMQ, Redis, or another queue while preserving atomic receipt and visibility
+semantics.
+
 ## Evaluations
 
 Cases can be JSON arrays or JSONL records:
