@@ -14,6 +14,8 @@ from llmkit_lite.llm import (
     LlmEndpointConfig,
     LlmGatewayError,
     LlmResponseFormat,
+    LlmToolChoice,
+    LlmToolDefinition,
     OpenAICompatibleAdapter,
     TokenUsage,
     ToolCall,
@@ -43,6 +45,18 @@ def _cfg(**overrides: object) -> LlmEndpointConfig:
     }
     defaults.update(overrides)
     return LlmEndpointConfig(**defaults)  # type: ignore[arg-type]
+
+
+def _weather_tool() -> LlmToolDefinition:
+    return LlmToolDefinition(
+        name="get_weather",
+        description="Get the current weather for a city.",
+        input_schema={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    )
 
 
 def test_capabilities_normalize_strings_and_report_missing_requirements() -> None:
@@ -99,14 +113,78 @@ def test_given_response_format_when_building_request_then_capability_is_required
     }
 
 
-def test_given_response_format_in_extra_body_when_building_request_then_rejected(
+def test_given_tools_when_building_request_then_data_is_frozen_and_capability_added(
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+    }
+    tool = LlmToolDefinition("get_weather", schema, "Get weather")
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "weather in Kuala Lumpur"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        tools=[tool],
+        tool_choice=LlmToolChoice.named("get_weather"),
+    )
+    schema["properties"]["city"]["type"] = "integer"  # type: ignore[index]
+
+    assert request.tools == (tool,)
+    assert request.tools[0].input_schema["properties"]["city"]["type"] == "string"
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array"},
+        {"type": "object", "properties": []},
+    ],
+)
+def test_given_invalid_tool_schema_when_declaring_tool_then_rejected(
+    schema: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="tool input schema"):
+        LlmToolDefinition("get_weather", schema)
+
+
+def test_given_duplicate_tools_when_building_request_then_rejected() -> None:
+    tool = _weather_tool()
+
+    with pytest.raises(ValueError, match="duplicate LLM tool declaration"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(tool, tool),
+        )
+
+
+def test_given_unknown_named_choice_when_building_request_then_rejected() -> None:
+    with pytest.raises(ValueError, match="named tool choice is not declared"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(_weather_tool(),),
+            tool_choice=LlmToolChoice.named("send_email"),
+        )
+
+
+@pytest.mark.parametrize("field", ["response_format", "tools", "tool_choice"])
+def test_given_normalized_field_in_extra_body_when_building_request_then_rejected(
+    field: str,
 ) -> None:
     with pytest.raises(ValueError, match="cannot override"):
         ChatCompletionRequest(
             messages=[{"role": "user", "content": "return JSON"}],
             max_tokens=100,
             timeout_seconds=5,
-            extra_body={"response_format": {"type": "json_object"}},
+            extra_body={field: {}},
         )
 
 
@@ -213,6 +291,47 @@ def test_chat_completion_body() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("choice", "expected"),
+    [
+        (LlmToolChoice.auto(), "auto"),
+        (LlmToolChoice.none(), "none"),
+        (LlmToolChoice.required(), "required"),
+        (
+            LlmToolChoice.named("get_weather"),
+            {"type": "function", "function": {"name": "get_weather"}},
+        ),
+    ],
+)
+def test_given_tools_when_building_body_then_openai_shape_is_used(
+    choice: LlmToolChoice,
+    expected: object,
+) -> None:
+    body = chat_completion_body(
+        [{"role": "user", "content": "weather in Kuala Lumpur"}],
+        cfg=_cfg(),
+        max_tokens=50,
+        tools=(_weather_tool(),),
+        tool_choice=choice,
+    )
+
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    assert body["tool_choice"] == expected
+
+
 def test_given_json_schema_format_when_building_body_then_openai_shape_is_used(
 ) -> None:
     body = chat_completion_body(
@@ -278,6 +397,8 @@ async def test_call_chat_completion_success() -> None:
         body = json.loads(request.content)
         assert body["model"] == "test-model"
         assert "response_format" not in body
+        assert "tools" not in body
+        assert "tool_choice" not in body
         return httpx.Response(200, content=_chat_content('{"ok": true}'))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -361,6 +482,57 @@ async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
     assert response.text == "done"
     assert response.provider == "local"
     assert response.model == "test-model"
+
+
+async def test_given_tools_and_text_only_endpoint_when_calling_then_rejected_preflight(
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("must not run"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "weather"}],
+                cfg=_cfg(capabilities={"text"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                tools=(_weather_tool(),),
+            )
+
+    assert exc_info.value.code == "llm_capability_unsupported"
+    assert "tool_calling" in exc_info.value.detail
+    assert calls == 0
+
+
+async def test_given_tool_capable_endpoint_when_calling_then_tools_reach_provider(
+) -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=_chat_content("choose later"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "weather"}],
+            cfg=_cfg(capabilities={"text", "tool_calling"}),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(_weather_tool(),),
+            tool_choice=LlmToolChoice.required(),
+        )
+
+    assert response.text == "choose later"
+    assert bodies[0]["tool_choice"] == "required"
+    tools = bodies[0]["tools"]
+    assert isinstance(tools, list)
+    assert tools[0]["function"]["name"] == "get_weather"
 
 
 def test_chat_completion_request_normalizes_and_detaches_messages() -> None:

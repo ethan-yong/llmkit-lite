@@ -138,6 +138,43 @@ async def inspect_router() -> ChatCompletionResponse:
 `llm_text_response_required` when a valid response contains tool calls but no
 text, so callers do not silently discard the requested action.
 
+### Tool declarations
+
+Declare tools independently of any provider payload. Supplying tools
+automatically requires the endpoint's `tool_calling` capability:
+
+```python
+from llmkit_lite.llm import (
+    LlmToolChoice,
+    LlmToolDefinition,
+    call_chat_completion_response,
+)
+
+
+weather = LlmToolDefinition(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    input_schema={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+response = await call_chat_completion_response(
+    messages,
+    cfg=tool_capable_cfg,
+    http_client=client,
+    max_tokens=300,
+    timeout_seconds=20,
+    tools=(weather,),
+    tool_choice=LlmToolChoice.auto(),
+)
+```
+
+Choices can be `auto`, `none`, `required`, or a specific declared tool using
+`LlmToolChoice.named("get_weather")`. This request boundary only exposes tools
+to the model; returned calls must still pass through an authorized executor.
+
 ### Capability negotiation
 
 Declare model capabilities on each endpoint and requirements on each request.

@@ -55,6 +55,15 @@ class LlmResponseFormatType(StrEnum):
     JSON_SCHEMA = "json_schema"
 
 
+class LlmToolChoiceMode(StrEnum):
+    """Provider-independent tool selection modes."""
+
+    AUTO = "auto"
+    NONE = "none"
+    REQUIRED = "required"
+    NAMED = "named"
+
+
 class LlmGatewayError(Exception):
     """Raised for LLM gateway failures.
 
@@ -188,6 +197,70 @@ class LlmResponseFormat:
             schema=schema,
             strict=strict,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LlmToolDefinition:
+    """Provider-independent declaration of one tool available to a model."""
+
+    name: str
+    input_schema: Mapping[str, JsonValue]
+    description: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _required_text(self.name, "tool name"))
+        object.__setattr__(
+            self,
+            "description",
+            _optional_text(self.description, "tool description"),
+        )
+        if not isinstance(self.input_schema, Mapping):
+            raise TypeError("tool input schema must be a mapping")
+        frozen = _freeze_json(self.input_schema, "tool input schema")
+        assert isinstance(frozen, Mapping)
+        if frozen.get("type") != "object":
+            raise ValueError("tool input schema type must be 'object'")
+        properties = frozen.get("properties")
+        if properties is not None and not isinstance(properties, Mapping):
+            raise ValueError("tool input schema properties must be a mapping")
+        object.__setattr__(self, "input_schema", frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class LlmToolChoice:
+    """Provider-independent instruction for selecting an available tool."""
+
+    mode: LlmToolChoiceMode | str
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, LlmToolChoiceMode):
+            try:
+                object.__setattr__(self, "mode", LlmToolChoiceMode(self.mode))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"unsupported tool choice mode: {self.mode!r}"
+                ) from exc
+        if self.mode is LlmToolChoiceMode.NAMED:
+            object.__setattr__(self, "name", _required_text(self.name, "tool name"))
+        elif self.name is not None:
+            raise ValueError("only a named tool choice can include a tool name")
+
+    @classmethod
+    def auto(cls) -> LlmToolChoice:
+        return cls(LlmToolChoiceMode.AUTO)
+
+    @classmethod
+    def none(cls) -> LlmToolChoice:
+        return cls(LlmToolChoiceMode.NONE)
+
+    @classmethod
+    def required(cls) -> LlmToolChoice:
+        return cls(LlmToolChoiceMode.REQUIRED)
+
+    @classmethod
+    def named(cls, name: str) -> LlmToolChoice:
+        return cls(LlmToolChoiceMode.NAMED, name=name)
 
 
 def _freeze_json(value: Any, field_name: str) -> JsonValue:
@@ -410,6 +483,8 @@ class ChatCompletionRequest:
     timeout_seconds: float
     temperature: float = 0
     response_format: LlmResponseFormat | None = None
+    tools: Sequence[LlmToolDefinition] = ()
+    tool_choice: LlmToolChoice | None = None
     extra_body: Mapping[str, Any] | None = None
     routing_metadata: Mapping[str, str] = field(default_factory=dict)
     required_capabilities: Iterable[LlmCapability | str] = field(
@@ -453,12 +528,40 @@ class ChatCompletionRequest:
             self.response_format, LlmResponseFormat
         ):
             raise TypeError("response_format must be an LlmResponseFormat or None")
+        if isinstance(self.tools, (str, bytes)) or not isinstance(
+            self.tools, Sequence
+        ):
+            raise TypeError("tools must be a sequence of LlmToolDefinition values")
+        normalized_tools = tuple(self.tools)
+        if not all(isinstance(tool, LlmToolDefinition) for tool in normalized_tools):
+            raise TypeError("tools must contain only LlmToolDefinition values")
+        tool_names: set[str] = set()
+        for tool in normalized_tools:
+            if tool.name in tool_names:
+                raise ValueError(f"duplicate LLM tool declaration: {tool.name}")
+            tool_names.add(tool.name)
+        object.__setattr__(self, "tools", normalized_tools)
+        if self.tool_choice is not None:
+            if not isinstance(self.tool_choice, LlmToolChoice):
+                raise TypeError("tool_choice must be an LlmToolChoice or None")
+            if not normalized_tools:
+                raise ValueError("tool_choice requires at least one tool declaration")
+            if (
+                self.tool_choice.mode is LlmToolChoiceMode.NAMED
+                and self.tool_choice.name not in tool_names
+            ):
+                raise ValueError(
+                    f"named tool choice is not declared: {self.tool_choice.name}"
+                )
         if self.extra_body is not None:
             if not isinstance(self.extra_body, Mapping):
                 raise TypeError("extra_body must be a mapping or None")
-            if "response_format" in self.extra_body:
+            reserved_fields = {"response_format", "tools", "tool_choice"}
+            overridden_fields = reserved_fields.intersection(self.extra_body)
+            if overridden_fields:
+                names = ", ".join(sorted(overridden_fields))
                 raise ValueError(
-                    "extra_body cannot override the normalized response_format"
+                    f"extra_body cannot override normalized fields: {names}"
                 )
             frozen_extra = _freeze_json(self.extra_body, "extra_body")
             assert isinstance(frozen_extra, Mapping)
@@ -488,6 +591,8 @@ class ChatCompletionRequest:
         )
         if self.response_format is not None:
             required_capabilities.add(LlmCapability(self.response_format.kind.value))
+        if normalized_tools or self.tool_choice is not None:
+            required_capabilities.add(LlmCapability.TOOL_CALLING)
         object.__setattr__(
             self,
             "required_capabilities",
@@ -637,6 +742,8 @@ def chat_completion_body(
     max_tokens: int,
     temperature: float = 0,
     response_format: LlmResponseFormat | None = None,
+    tools: Sequence[LlmToolDefinition] = (),
+    tool_choice: LlmToolChoice | None = None,
     extra_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a request body for an OpenAI-compatible chat completion."""
@@ -655,13 +762,20 @@ def chat_completion_body(
     if extra_body:
         frozen_extra = _freeze_json(extra_body, "extra_body")
         assert isinstance(frozen_extra, Mapping)
-        if "response_format" in frozen_extra:
+        reserved_fields = {"response_format", "tools", "tool_choice"}
+        overridden_fields = reserved_fields.intersection(frozen_extra)
+        if overridden_fields:
+            names = ", ".join(sorted(overridden_fields))
             raise ValueError(
-                "extra_body cannot override the normalized response_format"
+                f"extra_body cannot override normalized fields: {names}"
             )
         body.update(_thaw_json(frozen_extra))
     if response_format is not None:
         body["response_format"] = _openai_response_format(response_format)
+    if tools:
+        body["tools"] = [_openai_tool_definition(tool) for tool in tools]
+    if tool_choice is not None:
+        body["tool_choice"] = _openai_tool_choice(tool_choice)
     return body
 
 
@@ -677,6 +791,26 @@ def _openai_response_format(response_format: LlmResponseFormat) -> dict[str, Any
             "strict": response_format.strict,
             "schema": _thaw_json(response_format.schema),
         },
+    }
+
+
+def _openai_tool_definition(tool: LlmToolDefinition) -> dict[str, Any]:
+    function: dict[str, Any] = {
+        "name": tool.name,
+        "parameters": _thaw_json(tool.input_schema),
+    }
+    if tool.description is not None:
+        function["description"] = tool.description
+    return {"type": "function", "function": function}
+
+
+def _openai_tool_choice(tool_choice: LlmToolChoice) -> str | dict[str, Any]:
+    if tool_choice.mode is not LlmToolChoiceMode.NAMED:
+        return tool_choice.mode.value
+    assert tool_choice.name is not None
+    return {
+        "type": "function",
+        "function": {"name": tool_choice.name},
     }
 
 
@@ -772,6 +906,8 @@ class OpenAICompatibleAdapter:
             max_tokens=request.max_tokens,
             temperature=request.temperature,
             response_format=request.response_format,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
             extra_body=request.extra_body,
         )
 
@@ -902,6 +1038,8 @@ async def call_chat_completion_response(
     timeout_seconds: float,
     temperature: float = 0,
     response_format: LlmResponseFormat | None = None,
+    tools: Sequence[LlmToolDefinition] = (),
+    tool_choice: LlmToolChoice | None = None,
     extra_body: Mapping[str, Any] | None = None,
     required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> ChatCompletionResponse:
@@ -913,6 +1051,8 @@ async def call_chat_completion_response(
         timeout_seconds=timeout_seconds,
         temperature=temperature,
         response_format=response_format,
+        tools=tools,
+        tool_choice=tool_choice,
         extra_body=extra_body,
         required_capabilities=required_capabilities,
     )
@@ -932,6 +1072,8 @@ async def call_chat_completion(
     timeout_seconds: float,
     temperature: float = 0,
     response_format: LlmResponseFormat | None = None,
+    tools: Sequence[LlmToolDefinition] = (),
+    tool_choice: LlmToolChoice | None = None,
     extra_body: Mapping[str, Any] | None = None,
     required_capabilities: Iterable[LlmCapability | str] = (LlmCapability.TEXT,),
 ) -> str:
@@ -945,6 +1087,8 @@ async def call_chat_completion(
         timeout_seconds=timeout_seconds,
         temperature=temperature,
         response_format=response_format,
+        tools=tools,
+        tool_choice=tool_choice,
         extra_body=extra_body,
         required_capabilities=required_capabilities,
     )
