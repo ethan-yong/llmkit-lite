@@ -108,6 +108,107 @@ async def summarize(text: str) -> str:
         )
 ```
 
+Provider adapters return a normalized `ChatCompletionResponse` containing text,
+tool calls, finish reason, token usage, provider, model, and a deliberately small
+set of safe provider metadata. Use the response helper when those fields matter:
+
+```python
+import httpx
+
+from llmkit_lite.llm import (
+    ChatCompletionResponse,
+    call_chat_completion_response,
+    resolve_llm_config,
+)
+
+
+async def inspect_router() -> ChatCompletionResponse:
+    cfg = resolve_llm_config()
+    async with httpx.AsyncClient() as client:
+        return await call_chat_completion_response(
+            [{"role": "user", "content": "Inspect router 42"}],
+            cfg=cfg,
+            http_client=client,
+            max_tokens=300,
+            timeout_seconds=20,
+        )
+```
+
+`call_chat_completion()` remains a text-only compatibility helper. It raises
+`llm_text_response_required` when a valid response contains tool calls but no
+text, so callers do not silently discard the requested action.
+
+### Tool declarations
+
+Declare tools independently of any provider payload. Supplying tools
+automatically requires the endpoint's `tool_calling` capability:
+
+```python
+from llmkit_lite.llm import (
+    LlmToolChoice,
+    LlmToolDefinition,
+    call_chat_completion_response,
+)
+
+
+weather = LlmToolDefinition(
+    name="get_weather",
+    description="Get the current weather for a city.",
+    input_schema={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+response = await call_chat_completion_response(
+    messages,
+    cfg=tool_capable_cfg,
+    http_client=client,
+    max_tokens=300,
+    timeout_seconds=20,
+    tools=(weather,),
+    tool_choice=LlmToolChoice.auto(),
+)
+```
+
+Choices can be `auto`, `none`, `required`, or a specific declared tool using
+`LlmToolChoice.named("get_weather")`. This request boundary only exposes tools
+to the model; returned calls must still pass through an authorized executor.
+
+### Capability negotiation
+
+Declare model capabilities on each endpoint and requirements on each request.
+Incompatible requests are rejected before network execution:
+
+```python
+from llmkit_lite.llm import (
+    ChatCompletionRequest,
+    LlmCapabilities,
+    LlmEndpointConfig,
+)
+
+
+endpoint = LlmEndpointConfig(
+    provider="vllm",
+    base_url="http://127.0.0.1:8000",
+    model_name="tool-model",
+    capabilities=LlmCapabilities({"text", "tool_calling", "json_object"}),
+)
+request = ChatCompletionRequest(
+    messages=[{"role": "user", "content": "Inspect router 42"}],
+    max_tokens=300,
+    timeout_seconds=20,
+    required_capabilities={"text", "tool_calling"},
+)
+```
+
+The default endpoint and request capability is `text`, preserving existing
+text-only integrations. A direct incompatible call raises
+`llm_capability_unsupported`. The router skips incompatible candidates and
+tries declared fallbacks; if none support the request, it raises
+`llm_capabilities_unavailable`. Capability incompatibility does not consume
+retries or count as a circuit-breaker failure.
+
 ## Resilient Provider Routing
 
 Use `LlmRouter` when an application needs to select between providers, retry
@@ -175,6 +276,10 @@ async def complete(messages: list[dict[str, str]]) -> str:
         return await router.complete(request, http_client=client)
 ```
 
+Use `router.complete_response()` instead when the application needs the full
+normalized response. Retries and fallbacks return the selected adapter's
+response without translating it again.
+
 The default resilience policy tries each eligible route twice, with exponential
 backoff and jitter. A route's circuit opens after three consecutive calls exhaust
 their retries. After 30 seconds, one request is allowed to probe the route; a
@@ -188,9 +293,15 @@ is available to predicates but is not sent to providers or recorded in telemetry
 
 ## Structured Outputs
 
+Structured calls choose the strongest format declared by the endpoint:
+`json_schema`, then `json_object`. Native enforcement is required by default,
+so an incompatible endpoint fails before a network request instead of silently
+weakening the request.
+
 ```python
 from pydantic import BaseModel, Field
 
+from llmkit_lite.llm import LlmCapabilities, LlmEndpointConfig
 from llmkit_lite.structured import structured_json_call
 
 
@@ -199,6 +310,12 @@ class Classification(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+cfg = LlmEndpointConfig(
+    provider="vllm",
+    base_url="http://127.0.0.1:8000",
+    model_name="structured-model",
+    capabilities=LlmCapabilities({"text", "json_schema", "json_object"}),
+)
 result = await structured_json_call(
     messages,
     response_model=Classification,
@@ -211,6 +328,29 @@ result = await structured_json_call(
 if result.ok:
     classification = result.value
 ```
+
+The helper derives the provider request schema from the Pydantic model and
+still validates the returned JSON locally. To deliberately support a text-only
+endpoint, opt in to prompt-based fallback:
+
+```python
+from llmkit_lite.structured import StructuredOutputPolicy
+
+
+result = await structured_json_call(
+    messages,
+    response_model=Classification,
+    cfg=text_only_cfg,
+    http_client=client,
+    max_tokens=200,
+    timeout_seconds=10,
+    policy=StructuredOutputPolicy.ALLOW_PROMPT_FALLBACK,
+)
+```
+
+Use `StructuredOutputPolicy.REQUIRE_JSON_SCHEMA` when JSON object mode is not
+strong enough. Provider errors are surfaced directly; the adapter does not
+retry by dropping the requested format.
 
 ## FastAPI Helpers
 

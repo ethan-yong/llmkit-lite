@@ -7,11 +7,21 @@ from opentelemetry.trace import StatusCode
 
 from llmkit_lite.llm import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+    LlmCapabilities,
+    LlmCapability,
     LlmEndpointConfig,
     LlmGatewayError,
+    LlmResponseFormat,
+    LlmToolChoice,
+    LlmToolDefinition,
     OpenAICompatibleAdapter,
+    TokenUsage,
+    ToolCall,
     auth_headers,
     call_chat_completion,
+    call_chat_completion_response,
     chat_completion_body,
     chat_completions_url,
     normalize_api_base,
@@ -35,6 +45,147 @@ def _cfg(**overrides: object) -> LlmEndpointConfig:
     }
     defaults.update(overrides)
     return LlmEndpointConfig(**defaults)  # type: ignore[arg-type]
+
+
+def _weather_tool() -> LlmToolDefinition:
+    return LlmToolDefinition(
+        name="get_weather",
+        description="Get the current weather for a city.",
+        input_schema={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    )
+
+
+def test_capabilities_normalize_strings_and_report_missing_requirements() -> None:
+    capabilities = LlmCapabilities({"vision", LlmCapability.TEXT})
+
+    assert capabilities.supported == {
+        LlmCapability.TEXT,
+        LlmCapability.VISION,
+    }
+    assert capabilities.supports({"text"})
+    assert capabilities.missing({"text", "tool_calling"}) == {
+        LlmCapability.TOOL_CALLING
+    }
+    assert isinstance(capabilities.supported, frozenset)
+
+
+def test_unknown_capability_is_rejected_during_configuration() -> None:
+    with pytest.raises(ValueError, match="unsupported LLM capability"):
+        LlmCapabilities({"telepathy"})
+
+
+def test_endpoint_and_request_normalize_declared_capabilities() -> None:
+    endpoint = _cfg(capabilities={"text", "tool_calling"})
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "inspect router"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        required_capabilities={"tool_calling", LlmCapability.TEXT},
+    )
+
+    assert endpoint.capabilities.supported == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+    assert isinstance(request.required_capabilities, frozenset)
+
+
+def test_given_response_format_when_building_request_then_capability_is_required(
+) -> None:
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "return JSON"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        response_format=LlmResponseFormat.json_object(),
+    )
+
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.JSON_OBJECT,
+    }
+
+
+def test_given_tools_when_building_request_then_data_is_frozen_and_capability_added(
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+    }
+    tool = LlmToolDefinition("get_weather", schema, "Get weather")
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "weather in Kuala Lumpur"}],
+        max_tokens=100,
+        timeout_seconds=5,
+        tools=[tool],
+        tool_choice=LlmToolChoice.named("get_weather"),
+    )
+    schema["properties"]["city"]["type"] = "integer"  # type: ignore[index]
+
+    assert request.tools == (tool,)
+    assert request.tools[0].input_schema["properties"]["city"]["type"] == "string"
+    assert request.required_capabilities == {
+        LlmCapability.TEXT,
+        LlmCapability.TOOL_CALLING,
+    }
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array"},
+        {"type": "object", "properties": []},
+    ],
+)
+def test_given_invalid_tool_schema_when_declaring_tool_then_rejected(
+    schema: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="tool input schema"):
+        LlmToolDefinition("get_weather", schema)
+
+
+def test_given_duplicate_tools_when_building_request_then_rejected() -> None:
+    tool = _weather_tool()
+
+    with pytest.raises(ValueError, match="duplicate LLM tool declaration"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(tool, tool),
+        )
+
+
+def test_given_unknown_named_choice_when_building_request_then_rejected() -> None:
+    with pytest.raises(ValueError, match="named tool choice is not declared"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "weather"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(_weather_tool(),),
+            tool_choice=LlmToolChoice.named("send_email"),
+        )
+
+
+@pytest.mark.parametrize("field", ["response_format", "tools", "tool_choice"])
+def test_given_normalized_field_in_extra_body_when_building_request_then_rejected(
+    field: str,
+) -> None:
+    with pytest.raises(ValueError, match="cannot override"):
+        ChatCompletionRequest(
+            messages=[{"role": "user", "content": "return JSON"}],
+            max_tokens=100,
+            timeout_seconds=5,
+            extra_body={field: {}},
+        )
 
 
 def test_resolve_llm_config_local_default() -> None:
@@ -126,7 +277,7 @@ def test_chat_completion_body() -> None:
         cfg=_cfg(reasoning_effort="medium"),
         max_tokens=50,
         temperature=0.2,
-        response_format={"type": "json_object"},
+        response_format=LlmResponseFormat.json_object(),
         extra_body={"seed": 123},
     )
     assert body == {
@@ -140,11 +291,114 @@ def test_chat_completion_body() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("choice", "expected"),
+    [
+        (LlmToolChoice.auto(), "auto"),
+        (LlmToolChoice.none(), "none"),
+        (LlmToolChoice.required(), "required"),
+        (
+            LlmToolChoice.named("get_weather"),
+            {"type": "function", "function": {"name": "get_weather"}},
+        ),
+    ],
+)
+def test_given_tools_when_building_body_then_openai_shape_is_used(
+    choice: LlmToolChoice,
+    expected: object,
+) -> None:
+    body = chat_completion_body(
+        [{"role": "user", "content": "weather in Kuala Lumpur"}],
+        cfg=_cfg(),
+        max_tokens=50,
+        tools=(_weather_tool(),),
+        tool_choice=choice,
+    )
+
+    assert body["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    assert body["tool_choice"] == expected
+
+
+def test_given_json_schema_format_when_building_body_then_openai_shape_is_used(
+) -> None:
+    body = chat_completion_body(
+        [{"role": "user", "content": "return JSON"}],
+        cfg=_cfg(),
+        max_tokens=50,
+        response_format=LlmResponseFormat.json_schema(
+            name="demo_output",
+            schema={
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+            },
+        ),
+    )
+
+    assert body["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "demo_output",
+            "strict": False,
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+            },
+        },
+    }
+
+
+def test_chat_completion_body_serializes_normalized_tool_calls() -> None:
+    body = chat_completion_body(
+        [
+            ChatMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall("call-1", "lookup", {"device_id": "router-1"}),
+                ),
+            )
+        ],
+        cfg=_cfg(),
+        max_tokens=50,
+    )
+
+    assert body["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"device_id":"router-1"}',
+                    },
+                }
+            ],
+        }
+    ]
+
+
 async def test_call_chat_completion_success() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert body["model"] == "test-model"
-        assert body["response_format"] == {"type": "json_object"}
+        assert "response_format" not in body
+        assert "tools" not in body
+        assert "tool_choice" not in body
         return httpx.Response(200, content=_chat_content('{"ok": true}'))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -158,10 +412,57 @@ async def test_call_chat_completion_success() -> None:
     assert content == '{"ok": true}'
 
 
+async def test_compatible_capability_request_reaches_provider() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("done"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "inspect router"}],
+            cfg=_cfg(capabilities={"text", "tool_calling"}),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+            required_capabilities={"tool_calling"},
+        )
+
+    assert response.text == "done"
+    assert calls == 1
+
+
+async def test_incompatible_capability_request_never_reaches_provider() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("must not run"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(capabilities={"text"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                required_capabilities={"tool_calling"},
+            )
+
+    assert exc_info.value.code == "llm_capability_unsupported"
+    assert "tool_calling" in exc_info.value.detail
+    assert calls == 0
+
+
 async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "routing_metadata" not in body
+        assert "required_capabilities" not in body
         assert "private-value" not in request.content.decode()
         return httpx.Response(200, content=_chat_content("done"))
 
@@ -172,13 +473,246 @@ async def test_openai_adapter_does_not_transmit_routing_metadata() -> None:
         routing_metadata={"tenant": "private-value"},
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        content = await OpenAICompatibleAdapter().complete(
+        response = await OpenAICompatibleAdapter().complete(
             request,
             cfg=_cfg(),
             http_client=client,
         )
 
-    assert content == "done"
+    assert response.text == "done"
+    assert response.provider == "local"
+    assert response.model == "test-model"
+
+
+async def test_given_tools_and_text_only_endpoint_when_calling_then_rejected_preflight(
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_chat_content("must not run"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "weather"}],
+                cfg=_cfg(capabilities={"text"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                tools=(_weather_tool(),),
+            )
+
+    assert exc_info.value.code == "llm_capability_unsupported"
+    assert "tool_calling" in exc_info.value.detail
+    assert calls == 0
+
+
+async def test_given_tool_capable_endpoint_when_calling_then_tools_reach_provider(
+) -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, content=_chat_content("choose later"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "weather"}],
+            cfg=_cfg(capabilities={"text", "tool_calling"}),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+            tools=(_weather_tool(),),
+            tool_choice=LlmToolChoice.required(),
+        )
+
+    assert response.text == "choose later"
+    assert bodies[0]["tool_choice"] == "required"
+    tools = bodies[0]["tools"]
+    assert isinstance(tools, list)
+    assert tools[0]["function"]["name"] == "get_weather"
+
+
+def test_chat_completion_request_normalizes_and_detaches_messages() -> None:
+    source = {"role": "user", "content": "hello"}
+
+    request = ChatCompletionRequest(
+        messages=[source],
+        max_tokens=100,
+        timeout_seconds=5,
+    )
+    source["content"] = "changed"
+
+    assert request.messages == (ChatMessage(role="user", content="hello"),)
+
+
+def test_normalized_models_freeze_nested_provider_values() -> None:
+    arguments = {"filters": ["active"]}
+    metadata = {"region": {"name": "west"}}
+
+    tool_call = ToolCall("call-1", "lookup", arguments)
+    response = ChatCompletionResponse(
+        text=None,
+        provider="local",
+        model="test-model",
+        tool_calls=(tool_call,),
+        provider_metadata=metadata,
+    )
+    arguments["filters"].append("private")
+    metadata["region"]["name"] = "changed"
+
+    assert tool_call.arguments["filters"] == ("active",)
+    assert response.provider_metadata["region"]["name"] == "west"
+    with pytest.raises(TypeError):
+        response.provider_metadata["new"] = "value"  # type: ignore[index]
+
+
+async def test_call_chat_completion_response_normalizes_tool_calls_and_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-1",
+                "created": 123,
+                "system_fingerprint": "fp-safe",
+                "model": "returned-model",
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"device_id":"router-1"}',
+                                    },
+                                },
+                                {
+                                    "id": "call-2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_status",
+                                        "arguments": '{"include_history":true}',
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await call_chat_completion_response(
+            [{"role": "user", "content": "inspect router"}],
+            cfg=_cfg(),
+            http_client=client,
+            max_tokens=100,
+            timeout_seconds=5,
+        )
+
+    assert response == ChatCompletionResponse(
+        text=None,
+        provider="local",
+        model="returned-model",
+        tool_calls=(
+            ToolCall("call-1", "lookup", {"device_id": "router-1"}),
+            ToolCall("call-2", "get_status", {"include_history": True}),
+        ),
+        finish_reason="tool_calls",
+        usage=TokenUsage(input_tokens=7, output_tokens=3, total_tokens=10),
+        provider_metadata={
+            "response_id": "response-1",
+            "created": 123,
+            "system_fingerprint": "fp-safe",
+        },
+    )
+
+
+async def test_text_helper_rejects_tool_only_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    assert exc_info.value.code == "llm_text_response_required"
+
+
+async def test_invalid_tool_arguments_raise_stable_response_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": "not-json",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion_response(
+                [{"role": "user", "content": "inspect router"}],
+                cfg=_cfg(),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+            )
+
+    assert exc_info.value.code == "llm_invalid_response_json"
 
 
 async def test_call_chat_completion_creates_safe_client_span(
@@ -232,37 +766,29 @@ async def test_call_chat_completion_creates_safe_client_span(
     assert "private-api-key" not in exported
 
 
-async def test_call_chat_completion_retries_without_response_format_on_400(
-    in_memory_tracing,
+async def test_given_native_format_error_when_calling_then_format_is_not_downgraded(
 ) -> None:
     calls: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         calls.append(body)
-        if "response_format" in body:
-            return httpx.Response(400, json={"error": "unsupported"})
-        return httpx.Response(200, content=_chat_content('{"ok": true}'))
+        return httpx.Response(400, json={"error": "unsupported"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        content = await call_chat_completion(
-            [{"role": "user", "content": "hi"}],
-            cfg=_cfg(),
-            http_client=client,
-            max_tokens=100,
-            timeout_seconds=5,
-        )
-    assert content == '{"ok": true}'
-    assert len(calls) == 2
-    assert "response_format" not in calls[1]
-    llm_span = next(
-        span
-        for span in in_memory_tracing.get_finished_spans()
-        if span.name == "llm.chat_completion"
-    )
-    assert [event.name for event in llm_span.events] == [
-        "llm.response_format_retry"
-    ]
+        with pytest.raises(LlmGatewayError) as exc_info:
+            await call_chat_completion(
+                [{"role": "user", "content": "hi"}],
+                cfg=_cfg(capabilities={"text", "json_object"}),
+                http_client=client,
+                max_tokens=100,
+                timeout_seconds=5,
+                response_format=LlmResponseFormat.json_object(),
+            )
+
+    assert exc_info.value.code == "llm_http_400"
+    assert len(calls) == 1
+    assert calls[0]["response_format"] == {"type": "json_object"}
 
 
 async def test_call_chat_completion_timeout_raises(in_memory_tracing) -> None:

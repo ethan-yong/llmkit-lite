@@ -25,6 +25,7 @@ const providerDefaults = {
 
 let loading = true;
 let apiKeyConfigured = false;
+let declaredCapabilities = ["text"];
 let toastTimer;
 
 function endpoint(path) {
@@ -66,11 +67,13 @@ function setFieldValue(field, value) {
 function readForm() {
   const settings = { version: 1 };
   fields.forEach((field) => setPath(settings, field.dataset.path, fieldValue(field)));
+  settings.llm.capabilities = [...declaredCapabilities];
   settings.clear_api_key = clearSecret.checked;
   return settings;
 }
 
 function hydrate(settings) {
+  declaredCapabilities = [...(settings.llm.capabilities ?? ["text"])];
   fields.forEach((field) => {
     setFieldValue(field, getPath(settings, field.dataset.path));
   });

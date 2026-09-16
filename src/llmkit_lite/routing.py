@@ -15,10 +15,12 @@ import httpx
 
 from llmkit_lite.llm import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     LlmEndpointConfig,
     LlmGatewayError,
     LlmProviderAdapter,
     OpenAICompatibleAdapter,
+    missing_capabilities,
 )
 from llmkit_lite.observability import set_span_error, trace_span
 
@@ -292,7 +294,7 @@ class LlmRouter:
         *,
         http_client: httpx.AsyncClient,
         span: Any,
-    ) -> str:
+    ) -> ChatCompletionResponse:
         for attempt in range(1, self._policy.max_attempts_per_route + 1):
             _add_event(
                 span,
@@ -300,11 +302,16 @@ class LlmRouter:
                 _route_attributes(route, attempt=attempt),
             )
             try:
-                return await route.adapter.complete(
+                response = await route.adapter.complete(
                     request,
                     cfg=route.endpoint,
                     http_client=http_client,
                 )
+                if not isinstance(response, ChatCompletionResponse):
+                    raise TypeError(
+                        "LLM provider adapters must return ChatCompletionResponse"
+                    )
+                return response
             except LlmGatewayError as exc:
                 _add_event(
                     span,
@@ -336,13 +343,13 @@ class LlmRouter:
                 await self._sleep(delay)
         raise AssertionError("retry loop completed without returning or raising")
 
-    async def complete(
+    async def complete_response(
         self,
         request: ChatCompletionRequest,
         *,
         http_client: httpx.AsyncClient,
-    ) -> str:
-        """Resolve a route, retry it, and use its flat fallback chain."""
+    ) -> ChatCompletionResponse:
+        """Resolve a route and return its normalized provider response."""
 
         primary = self.resolve(request)
         candidate_names = (primary.name, *primary.fallback_routes)
@@ -354,11 +361,35 @@ class LlmRouter:
             _add_event(span, "llm.route_selected", _route_attributes(primary))
             last_error: LlmGatewayError | None = None
             attempted_any = False
+            compatible_any = False
             previous_route = primary.name
             previous_error_type = "llm_circuit_open"
 
             for index, route_name in enumerate(candidate_names):
                 route = self._routes[route_name]
+                missing = missing_capabilities(request, route.endpoint)
+                if missing:
+                    missing_names = ",".join(
+                        sorted(capability.value for capability in missing)
+                    )
+                    logger.info(
+                        "Skipping incompatible LLM route %s (missing=%s)",
+                        route.name,
+                        missing_names,
+                    )
+                    _add_event(
+                        span,
+                        "llm.route_incompatible",
+                        {
+                            **_route_attributes(route),
+                            "llmkit.capability.missing": missing_names,
+                        },
+                    )
+                    previous_route = route.name
+                    previous_error_type = "llm_capability_unsupported"
+                    continue
+
+                compatible_any = True
                 circuit = self._circuits[route_name]
                 allowed, is_probe = await circuit.acquire(
                     now=self._clock(),
@@ -443,14 +474,36 @@ class LlmRouter:
                 raise error from last_error
 
             assert not attempted_any
-            error = LlmGatewayError(
-                "llm_routes_unavailable",
-                "all configured LLM route circuits are open",
-            )
+            if compatible_any:
+                error = LlmGatewayError(
+                    "llm_routes_unavailable",
+                    "all compatible LLM route circuits are open",
+                )
+            else:
+                error = LlmGatewayError(
+                    "llm_capabilities_unavailable",
+                    "no configured LLM route supports the required capabilities",
+                )
             if span is not None:
                 span.set_attribute("error.type", error.code)
                 set_span_error(span, error.code)
             raise error
+
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        http_client: httpx.AsyncClient,
+    ) -> str:
+        """Resolve a route and return text for compatibility-oriented callers."""
+
+        response = await self.complete_response(request, http_client=http_client)
+        if response.text is None:
+            raise LlmGatewayError(
+                "llm_text_response_required",
+                "LLM response did not contain text content",
+            )
+        return response.text
 
 
 def _route_attributes(

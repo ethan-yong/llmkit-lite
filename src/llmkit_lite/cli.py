@@ -148,7 +148,6 @@ async def _inspect_chat(cfg: LlmEndpointConfig) -> str:
             http_client=client,
             max_tokens=80,
             timeout_seconds=60,
-            use_response_format=False,
         )
 
 
@@ -252,7 +251,6 @@ def eval_cases(
                         http_client=client,
                         max_tokens=max_tokens,
                         timeout_seconds=timeout_seconds,
-                        use_response_format=False,
                     )
 
                 report = await run_evals(cases, target, scorer=_exact_scorer)
