@@ -465,6 +465,27 @@ with principal_context(principal):
     result = await tools.execute("weather", {"city": "Kuala Lumpur"})
 ```
 
+Normalized model tool calls can pass through the same boundary and return a
+tool message ready for the next model request:
+
+```python
+from llmkit_lite.llm import ToolCall
+
+
+model_call = ToolCall(
+    id="call-1",
+    name="weather",
+    arguments={"city": "Kuala Lumpur"},
+)
+with principal_context(principal):
+    tool_message = await tools.execute_call(model_call)
+```
+
+String results become tool-message content unchanged. Other JSON-compatible
+results are encoded deterministically; unsupported results raise the safe
+`tool_invalid_result` error. Authorization denials, unknown tools, handler
+failures, and cancellation still propagate without fabricating a tool message.
+
 The default `ScopeAuthorizationPolicy` denies execution when there is no active
 principal, when the principal lacks any required scope, or when a tool declares
 an empty required-scope set. An application can pass a custom authorization

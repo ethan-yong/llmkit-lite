@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from llmkit_lite.authorization import (
     principal_context,
     require_authorization,
 )
+from llmkit_lite.llm import ChatMessage, ToolCall
 from llmkit_lite.observability import set_span_error, trace_span
 
 ToolHandler = Callable[[Mapping[str, Any]], Any | Awaitable[Any]]
@@ -77,12 +79,46 @@ class ToolExecutionError(Exception):
     """Safe tool-boundary failure suitable for application error mapping."""
 
     def __init__(self, code: str) -> None:
-        if code != "tool_not_found":
+        details = {
+            "tool_not_found": "tool is not registered",
+            "tool_invalid_result": "tool returned an unsupported result",
+        }
+        if code not in details:
             raise ValueError("unsupported tool execution error code")
-        detail = "tool is not registered"
+        detail = details[code]
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def _json_result_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("tool result object keys must be strings")
+            copied[key] = _json_result_value(item)
+        return copied
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_json_result_value(item) for item in value]
+    raise TypeError("tool result must be JSON-compatible")
+
+
+def _tool_result_content(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(
+            _json_result_value(result),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise ToolExecutionError("tool_invalid_result") from None
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -246,3 +282,25 @@ class AuthorizedToolExecutor:
                 },
             )
             return result
+
+    async def execute_call(
+        self,
+        call: ToolCall,
+        *,
+        principal: Principal | None = None,
+    ) -> ChatMessage:
+        """Authorize one model-requested tool call and return its tool message."""
+
+        if not isinstance(call, ToolCall):
+            raise TypeError("call must be a ToolCall")
+        result = await self.execute(
+            call.name,
+            call.arguments,
+            principal=principal,
+        )
+        return ChatMessage(
+            role="tool",
+            content=_tool_result_content(result),
+            name=call.name,
+            tool_call_id=call.id,
+        )
