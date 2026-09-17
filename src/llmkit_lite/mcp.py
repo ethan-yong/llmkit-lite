@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from llmkit_lite.authorization import AuthorizationPolicy, Principal, get_principal
+from llmkit_lite.llm import ChatMessage, LlmToolDefinition, ToolCall
 from llmkit_lite.observability import set_span_error, trace_span
 from llmkit_lite.tools import AuthorizedToolExecutor, ToolDefinition
 
@@ -203,6 +204,25 @@ class McpToolResult:
             "structured_content",
             _freeze_json(self.structured_content, "MCP structured content"),
         )
+
+
+def _mcp_result_content(result: McpToolResult) -> str:
+    payload = (
+        result.structured_content
+        if result.structured_content is not None
+        else result.content
+    )
+    try:
+        thawed = _thaw_json(payload, "MCP tool result")
+        return json.dumps(
+            thawed,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise McpGatewayError("mcp_invalid_response") from None
 
 
 class McpAuthenticationProvider(Protocol):
@@ -798,6 +818,11 @@ class AuthorizedMcpToolExecutor:
 
         definitions: list[ToolDefinition] = []
         for descriptor in descriptor_map.values():
+            required_tool_scopes = normalized_scopes.get(
+                descriptor.qualified_name,
+                frozenset(),
+            )
+            expose_to_model = bool(required_tool_scopes)
 
             async def handler(
                 envelope: Mapping[str, Any],
@@ -809,10 +834,11 @@ class AuthorizedMcpToolExecutor:
                 ToolDefinition(
                     name=descriptor.qualified_name,
                     handler=handler,
-                    required_scopes=normalized_scopes.get(
-                        descriptor.qualified_name,
-                        frozenset(),
+                    required_scopes=required_tool_scopes,
+                    input_schema=(
+                        descriptor.input_schema if expose_to_model else None
                     ),
+                    description=(descriptor.description if expose_to_model else None),
                 )
             )
         object.__setattr__(
@@ -852,6 +878,12 @@ class AuthorizedMcpToolExecutor:
 
         return tuple(self._descriptors.values())
 
+    @property
+    def llm_tools(self) -> tuple[LlmToolDefinition, ...]:
+        """Return model declarations for the approved MCP descriptors."""
+
+        return self._executor.llm_tools
+
     async def execute(
         self,
         tool_name: str,
@@ -880,6 +912,30 @@ class AuthorizedMcpToolExecutor:
             normalized_name,
             envelope,
             principal=principal,
+        )
+
+    async def execute_call(
+        self,
+        call: ToolCall,
+        *,
+        principal: Principal | None = None,
+        idempotency_key: str | None = None,
+    ) -> ChatMessage:
+        """Execute one model-requested MCP call and return its tool message."""
+
+        if not isinstance(call, ToolCall):
+            raise TypeError("call must be a ToolCall")
+        result = await self.execute(
+            call.name,
+            call.arguments,
+            principal=principal,
+            idempotency_key=(call.id if idempotency_key is None else idempotency_key),
+        )
+        return ChatMessage(
+            role="tool",
+            content=_mcp_result_content(result),
+            name=call.name,
+            tool_call_id=call.id,
         )
 
     async def _execute_remote(

@@ -15,7 +15,7 @@ from llmkit_lite.authorization import (
     get_principal,
     principal_context,
 )
-from llmkit_lite.llm import ChatMessage, ToolCall
+from llmkit_lite.llm import ChatMessage, LlmToolDefinition, ToolCall
 from llmkit_lite.tools import (
     AuthorizedToolExecutor,
     ToolDefinition,
@@ -70,6 +70,22 @@ def test_tool_definition_normalizes_and_freezes_values() -> None:
             ),
             TypeError,
         ),
+        (
+            lambda: ToolDefinition(
+                "weather",
+                lambda arguments: None,
+                description="Model description",
+            ),
+            ValueError,
+        ),
+        (
+            lambda: ToolDefinition(
+                "weather",
+                lambda arguments: None,
+                input_schema={"type": "array"},
+            ),
+            ValueError,
+        ),
     ],
 )
 def test_tool_definition_rejects_invalid_values(factory, expected_error) -> None:
@@ -88,6 +104,55 @@ def test_executor_validates_registry_and_policy() -> None:
         AuthorizedToolExecutor("weather")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="implement authorize"):
         AuthorizedToolExecutor((definition,), policy=object())  # type: ignore[arg-type]
+
+
+def test_given_exposed_registrations_when_listing_llm_tools_then_safe_data_is_returned(
+) -> None:
+    weather_schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+    }
+    weather = ToolDefinition(
+        "weather",
+        lambda arguments: "sunny",
+        required_scopes={"private:weather"},
+        input_schema=weather_schema,
+        description="Get weather",
+    )
+    hidden = ToolDefinition(
+        "internal",
+        lambda arguments: "private",
+        required_scopes={"private:internal"},
+    )
+    clock = ToolDefinition(
+        "clock",
+        lambda arguments: "12:00",
+        required_scopes={"private:clock"},
+        input_schema={"type": "object", "properties": {}},
+    )
+    executor = AuthorizedToolExecutor((weather, hidden, clock))
+    weather_schema["properties"]["city"]["type"] = "integer"  # type: ignore[index]
+
+    assert executor.llm_tools == (
+        LlmToolDefinition(
+            "weather",
+            {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+            "Get weather",
+        ),
+        LlmToolDefinition("clock", {"type": "object", "properties": {}}),
+    )
+    assert not hasattr(executor.llm_tools[0], "handler")
+    assert not hasattr(executor.llm_tools[0], "required_scopes")
+
+
+def test_given_execution_only_registrations_when_listing_llm_tools_then_empty(
+) -> None:
+    executor = AuthorizedToolExecutor((_definition(lambda arguments: "ok"),))
+
+    assert executor.llm_tools == ()
 
 
 async def test_allowed_sync_tool_executes_once_with_shallow_copy() -> None:

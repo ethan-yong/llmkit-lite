@@ -452,9 +452,16 @@ tools = AuthorizedToolExecutor(
             name="weather",
             handler=get_weather,
             required_scopes={"tools:weather:execute"},
+            description="Get the current weather for a city.",
+            input_schema={
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
         ),
     )
 )
+model_tools = tools.llm_tools
 
 principal = Principal(
     subject="user-123",
@@ -498,6 +505,10 @@ arguments. Its audit logs and `tool.execute` spans contain only the registered
 tool name, outcome, stable reason code, and safe exception type. Subjects,
 scopes, arguments, results, credentials, and exception messages are excluded.
 
+Adding an input schema explicitly exposes a registration through `llm_tools`;
+registrations without schemas remain execution-only. Model declarations contain
+only names, descriptions, and schemas—never handlers, scopes, or policy data.
+
 ## Secure MCP Tool Execution
 
 MCP integrations use two separate steps: discover the tools exposed by a
@@ -513,6 +524,7 @@ import os
 from collections.abc import Mapping
 
 from llmkit_lite.authorization import Principal
+from llmkit_lite.llm import ToolCall
 from llmkit_lite.mcp import (
     AuthorizedMcpToolExecutor,
     McpExecutionPolicy,
@@ -564,6 +576,19 @@ result = await executor.execute(
     ),
     idempotency_key="search-request-123",
 )
+
+model_tools = executor.llm_tools
+tool_message = await executor.execute_call(
+    ToolCall(
+        id="call-1",
+        name="docs.search",
+        arguments={"query": "provider routing"},
+    ),
+    principal=Principal(
+        "user-123",
+        scopes={"mcp:docs.search:execute"},
+    ),
+)
 ```
 
 The default scope policy denies unauthenticated callers, missing scopes, and
@@ -571,6 +596,12 @@ tools without an explicit scope declaration. Authorization and JSON Schema
 validation happen before credentials are resolved or a remote request is sent.
 Calls have a 30-second default timeout and are attempted once: this layer does
 not silently retry remote tools because many tools have side effects.
+
+Only MCP descriptors with a non-empty required-scope mapping are model-visible;
+their declarations use server-qualified names to prevent collisions. Model
+calls prefer structured MCP results and otherwise encode content blocks as
+JSON. The model call ID is used as the default idempotency key, so replaying the
+same call does not repeat a successful remote side effect.
 
 An idempotency key deduplicates matching calls for the same principal and tool.
 The built-in store is process-local, keeps successful results for five minutes,

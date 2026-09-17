@@ -20,7 +20,7 @@ from llmkit_lite.authorization import (
     principal_context,
     require_authorization,
 )
-from llmkit_lite.llm import ChatMessage, ToolCall
+from llmkit_lite.llm import ChatMessage, LlmToolDefinition, ToolCall
 from llmkit_lite.observability import set_span_error, trace_span
 
 ToolHandler = Callable[[Mapping[str, Any]], Any | Awaitable[Any]]
@@ -63,6 +63,14 @@ class ToolDefinition:
     name: str
     handler: ToolHandler
     required_scopes: Set[str] = field(default_factory=frozenset)
+    input_schema: Mapping[str, Any] | None = None
+    description: str | None = None
+    _llm_definition: LlmToolDefinition | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _normalize_name(self.name))
@@ -73,6 +81,24 @@ class ToolDefinition:
             "required_scopes",
             _normalize_scopes(self.required_scopes),
         )
+        if self.input_schema is None:
+            if self.description is not None:
+                raise ValueError("tool description requires an input schema")
+            return
+        llm_definition = LlmToolDefinition(
+            name=self.name,
+            input_schema=self.input_schema,
+            description=self.description,
+        )
+        object.__setattr__(self, "input_schema", llm_definition.input_schema)
+        object.__setattr__(self, "description", llm_definition.description)
+        object.__setattr__(self, "_llm_definition", llm_definition)
+
+    @property
+    def llm_definition(self) -> LlmToolDefinition | None:
+        """Return the model-facing declaration, if this tool is exposed."""
+
+        return self._llm_definition
 
 
 class ToolExecutionError(Exception):
@@ -157,6 +183,16 @@ class AuthorizedToolExecutor:
         """Return the registered definitions in declaration order."""
 
         return tuple(self._tools.values())
+
+    @property
+    def llm_tools(self) -> tuple[LlmToolDefinition, ...]:
+        """Return explicitly exposed model declarations in registration order."""
+
+        return tuple(
+            definition.llm_definition
+            for definition in self._tools.values()
+            if definition.llm_definition is not None
+        )
 
     async def execute(
         self,

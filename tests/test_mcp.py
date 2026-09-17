@@ -10,6 +10,7 @@ import pytest
 from opentelemetry.trace import StatusCode
 
 from llmkit_lite.authorization import AuthorizationError, Principal, principal_context
+from llmkit_lite.llm import ChatMessage, LlmToolDefinition, ToolCall
 from llmkit_lite.mcp import (
     AuthorizedMcpToolExecutor,
     InMemoryMcpIdempotencyStore,
@@ -531,6 +532,41 @@ def test_execution_models_validate_and_freeze_values() -> None:
             McpExecutionPolicy(timeout_seconds=value)  # type: ignore[arg-type]
 
 
+def test_given_mcp_descriptors_when_listing_llm_tools_then_qualified_tools_returned(
+) -> None:
+    executor = _remote_executor(InvocationAdapter())
+
+    assert executor.llm_tools == (
+        LlmToolDefinition(
+            name="docs.search",
+            description="Search internal documentation",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        ),
+    )
+    assert not hasattr(executor.llm_tools[0], "required_scopes")
+    assert not hasattr(executor.llm_tools[0], "endpoint")
+
+
+def test_given_unscoped_mcp_descriptor_when_listing_llm_tools_then_it_stays_hidden(
+) -> None:
+    server = _server(adapter=InvocationAdapter())
+    executor = AuthorizedMcpToolExecutor(
+        McpServerRegistry((server,)),
+        (_tool(name="search"), _tool(name="delete")),
+        {"docs.search": {"mcp:docs.search:execute"}},
+    )
+
+    assert [tool.name for tool in executor.llm_tools] == ["docs.search"]
+    assert [tool.qualified_name for tool in executor.tools] == [
+        "docs.search",
+        "docs.delete",
+    ]
+
+
 async def test_authorized_remote_call_uses_principal_credentials_and_policy() -> None:
     adapter = InvocationAdapter()
     credentials = RecordingAuthenticationProvider()
@@ -558,6 +594,61 @@ async def test_authorized_remote_call_uses_principal_credentials_and_policy() ->
             "timeout": 7.0,
         }
     ]
+
+
+async def test_given_mcp_model_call_when_executed_then_structured_tool_message_returned(
+) -> None:
+    adapter = InvocationAdapter()
+    executor = _remote_executor(adapter)
+    call = ToolCall("call-1", "docs.search", {"query": "routing"})
+
+    first = await executor.execute_call(call, principal=_remote_principal())
+    second = await executor.execute_call(call, principal=_remote_principal())
+
+    assert first == ChatMessage(
+        role="tool",
+        content='{"count":1}',
+        name="docs.search",
+        tool_call_id="call-1",
+    )
+    assert second == first
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["arguments"] == {"query": "routing"}
+
+
+async def test_given_mcp_content_blocks_when_executed_then_blocks_are_encoded() -> None:
+    result = McpToolResult(
+        content=(
+            {"type": "text", "text": "found"},
+            {"type": "resource", "uri": "docs://routing"},
+        )
+    )
+    executor = _remote_executor(InvocationAdapter(result))
+
+    message = await executor.execute_call(
+        ToolCall("call-2", "docs.search", {"query": "routing"}),
+        principal=_remote_principal(),
+    )
+
+    assert message.content == (
+        '[{"text":"found","type":"text"},'
+        '{"type":"resource","uri":"docs://routing"}]'
+    )
+
+
+async def test_given_invalid_mcp_model_call_when_executed_then_remote_is_not_called(
+) -> None:
+    adapter = InvocationAdapter()
+    executor = _remote_executor(adapter)
+
+    with pytest.raises(McpGatewayError) as exc_info:
+        await executor.execute_call(
+            ToolCall("call-1", "docs.search", {"query": 42}),
+            principal=_remote_principal(),
+        )
+
+    assert exc_info.value.code == "mcp_invalid_arguments"
+    assert adapter.calls == []
 
 
 async def test_active_principal_is_used_for_remote_credentials() -> None:
