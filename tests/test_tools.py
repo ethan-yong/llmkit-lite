@@ -15,6 +15,7 @@ from llmkit_lite.authorization import (
     get_principal,
     principal_context,
 )
+from llmkit_lite.llm import ChatMessage, LlmToolDefinition, ToolCall
 from llmkit_lite.tools import (
     AuthorizedToolExecutor,
     ToolDefinition,
@@ -69,6 +70,22 @@ def test_tool_definition_normalizes_and_freezes_values() -> None:
             ),
             TypeError,
         ),
+        (
+            lambda: ToolDefinition(
+                "weather",
+                lambda arguments: None,
+                description="Model description",
+            ),
+            ValueError,
+        ),
+        (
+            lambda: ToolDefinition(
+                "weather",
+                lambda arguments: None,
+                input_schema={"type": "array"},
+            ),
+            ValueError,
+        ),
     ],
 )
 def test_tool_definition_rejects_invalid_values(factory, expected_error) -> None:
@@ -87,6 +104,55 @@ def test_executor_validates_registry_and_policy() -> None:
         AuthorizedToolExecutor("weather")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="implement authorize"):
         AuthorizedToolExecutor((definition,), policy=object())  # type: ignore[arg-type]
+
+
+def test_given_exposed_registrations_when_listing_llm_tools_then_safe_data_is_returned(
+) -> None:
+    weather_schema = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+    }
+    weather = ToolDefinition(
+        "weather",
+        lambda arguments: "sunny",
+        required_scopes={"private:weather"},
+        input_schema=weather_schema,
+        description="Get weather",
+    )
+    hidden = ToolDefinition(
+        "internal",
+        lambda arguments: "private",
+        required_scopes={"private:internal"},
+    )
+    clock = ToolDefinition(
+        "clock",
+        lambda arguments: "12:00",
+        required_scopes={"private:clock"},
+        input_schema={"type": "object", "properties": {}},
+    )
+    executor = AuthorizedToolExecutor((weather, hidden, clock))
+    weather_schema["properties"]["city"]["type"] = "integer"  # type: ignore[index]
+
+    assert executor.llm_tools == (
+        LlmToolDefinition(
+            "weather",
+            {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+            "Get weather",
+        ),
+        LlmToolDefinition("clock", {"type": "object", "properties": {}}),
+    )
+    assert not hasattr(executor.llm_tools[0], "handler")
+    assert not hasattr(executor.llm_tools[0], "required_scopes")
+
+
+def test_given_execution_only_registrations_when_listing_llm_tools_then_empty(
+) -> None:
+    executor = AuthorizedToolExecutor((_definition(lambda arguments: "ok"),))
+
+    assert executor.llm_tools == ()
 
 
 async def test_allowed_sync_tool_executes_once_with_shallow_copy() -> None:
@@ -129,6 +195,155 @@ async def test_allowed_async_tool_executes_once() -> None:
         == "Penang"
     )
     assert calls == 1
+
+
+async def test_given_model_tool_call_when_executed_then_tool_message_is_returned(
+) -> None:
+    observed: list[tuple[Mapping[str, Any], str | None]] = []
+
+    async def handler(arguments: Mapping[str, Any]) -> dict[str, object]:
+        principal = get_principal()
+        observed.append((arguments, principal.subject if principal else None))
+        return {"forecast": "sunny", "city": arguments["city"]}
+
+    executor = AuthorizedToolExecutor((_definition(handler),))
+    call = ToolCall(
+        "call-1",
+        "weather",
+        {"city": "Kuala Lumpur", "days": [1, 2]},
+    )
+
+    message = await executor.execute_call(call, principal=_principal("caller"))
+
+    assert message == ChatMessage(
+        role="tool",
+        content='{"city":"Kuala Lumpur","forecast":"sunny"}',
+        name="weather",
+        tool_call_id="call-1",
+    )
+    assert observed == [
+        ({"city": "Kuala Lumpur", "days": (1, 2)}, "caller"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ("plain text", "plain text"),
+        ({"b": 2, "a": [True, None]}, '{"a":[true,null],"b":2}'),
+        (["alpha", 2], '["alpha",2]'),
+        (42, "42"),
+        (1.25, "1.25"),
+        (True, "true"),
+        (None, "null"),
+    ],
+)
+async def test_given_supported_result_when_executing_call_then_content_is_deterministic(
+    result: object,
+    expected: str,
+) -> None:
+    executor = AuthorizedToolExecutor((_definition(lambda arguments: result),))
+
+    message = await executor.execute_call(
+        ToolCall("call-1", "weather"),
+        principal=_principal(),
+    )
+
+    assert message.content == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        object(),
+        b"bytes",
+        {"invalid": object()},
+        {1: "non-string-key"},
+        float("nan"),
+        float("inf"),
+    ],
+)
+async def test_given_invalid_result_when_executing_call_then_safe_error_is_raised(
+    result: object,
+) -> None:
+    executor = AuthorizedToolExecutor((_definition(lambda arguments: result),))
+
+    with pytest.raises(ToolExecutionError) as exc_info:
+        await executor.execute_call(
+            ToolCall("call-1", "weather"),
+            principal=_principal(),
+        )
+
+    assert exc_info.value.code == "tool_invalid_result"
+    assert exc_info.value.detail == "tool returned an unsupported result"
+    assert "object at" not in str(exc_info.value)
+
+
+async def test_given_denied_model_call_when_executing_then_handler_is_not_invoked(
+) -> None:
+    calls = 0
+
+    def handler(arguments: Mapping[str, Any]) -> str:
+        nonlocal calls
+        calls += 1
+        return "must not run"
+
+    executor = AuthorizedToolExecutor((_definition(handler),))
+
+    with pytest.raises(AuthorizationError):
+        await executor.execute_call(
+            ToolCall("call-1", "weather", {"private": "value"}),
+            principal=Principal("caller", scopes={"other"}),
+        )
+
+    assert calls == 0
+
+
+async def test_given_unknown_model_call_when_executing_then_safe_error_is_unchanged(
+) -> None:
+    calls = 0
+
+    def handler(arguments: Mapping[str, Any]) -> str:
+        nonlocal calls
+        calls += 1
+        return "must not run"
+
+    executor = AuthorizedToolExecutor((_definition(handler),))
+
+    with pytest.raises(ToolExecutionError) as exc_info:
+        await executor.execute_call(
+            ToolCall("call-1", "unknown", {"private": "value"}),
+            principal=_principal(),
+        )
+
+    assert exc_info.value.code == "tool_not_found"
+    assert calls == 0
+
+
+async def test_given_handler_failure_when_executing_call_then_error_is_unchanged(
+) -> None:
+    error = RuntimeError("private handler failure")
+
+    def handler(arguments: Mapping[str, Any]) -> None:
+        raise error
+
+    executor = AuthorizedToolExecutor((_definition(handler),))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await executor.execute_call(
+            ToolCall("call-1", "weather"),
+            principal=_principal(),
+        )
+
+    assert exc_info.value is error
+
+
+async def test_given_non_tool_call_when_executing_then_rejected_before_authorization(
+) -> None:
+    executor = AuthorizedToolExecutor((_definition(lambda arguments: "ok"),))
+
+    with pytest.raises(TypeError, match="call must be a ToolCall"):
+        await executor.execute_call(object())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

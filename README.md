@@ -452,9 +452,16 @@ tools = AuthorizedToolExecutor(
             name="weather",
             handler=get_weather,
             required_scopes={"tools:weather:execute"},
+            description="Get the current weather for a city.",
+            input_schema={
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
         ),
     )
 )
+model_tools = tools.llm_tools
 
 principal = Principal(
     subject="user-123",
@@ -464,6 +471,27 @@ principal = Principal(
 with principal_context(principal):
     result = await tools.execute("weather", {"city": "Kuala Lumpur"})
 ```
+
+Normalized model tool calls can pass through the same boundary and return a
+tool message ready for the next model request:
+
+```python
+from llmkit_lite.llm import ToolCall
+
+
+model_call = ToolCall(
+    id="call-1",
+    name="weather",
+    arguments={"city": "Kuala Lumpur"},
+)
+with principal_context(principal):
+    tool_message = await tools.execute_call(model_call)
+```
+
+String results become tool-message content unchanged. Other JSON-compatible
+results are encoded deterministically; unsupported results raise the safe
+`tool_invalid_result` error. Authorization denials, unknown tools, handler
+failures, and cancellation still propagate without fabricating a tool message.
 
 The default `ScopeAuthorizationPolicy` denies execution when there is no active
 principal, when the principal lacks any required scope, or when a tool declares
@@ -476,6 +504,10 @@ and asynchronous handlers and passes an allowed handler a shallow copy of its
 arguments. Its audit logs and `tool.execute` spans contain only the registered
 tool name, outcome, stable reason code, and safe exception type. Subjects,
 scopes, arguments, results, credentials, and exception messages are excluded.
+
+Adding an input schema explicitly exposes a registration through `llm_tools`;
+registrations without schemas remain execution-only. Model declarations contain
+only names, descriptions, and schemas—never handlers, scopes, or policy data.
 
 ## Secure MCP Tool Execution
 
@@ -492,6 +524,7 @@ import os
 from collections.abc import Mapping
 
 from llmkit_lite.authorization import Principal
+from llmkit_lite.llm import ToolCall
 from llmkit_lite.mcp import (
     AuthorizedMcpToolExecutor,
     McpExecutionPolicy,
@@ -543,6 +576,19 @@ result = await executor.execute(
     ),
     idempotency_key="search-request-123",
 )
+
+model_tools = executor.llm_tools
+tool_message = await executor.execute_call(
+    ToolCall(
+        id="call-1",
+        name="docs.search",
+        arguments={"query": "provider routing"},
+    ),
+    principal=Principal(
+        "user-123",
+        scopes={"mcp:docs.search:execute"},
+    ),
+)
 ```
 
 The default scope policy denies unauthenticated callers, missing scopes, and
@@ -551,12 +597,64 @@ validation happen before credentials are resolved or a remote request is sent.
 Calls have a 30-second default timeout and are attempted once: this layer does
 not silently retry remote tools because many tools have side effects.
 
+Only MCP descriptors with a non-empty required-scope mapping are model-visible;
+their declarations use server-qualified names to prevent collisions. Model
+calls prefer structured MCP results and otherwise encode content blocks as
+JSON. The model call ID is used as the default idempotency key, so replaying the
+same call does not repeat a successful remote side effect.
+
 An idempotency key deduplicates matching calls for the same principal and tool.
 The built-in store is process-local, keeps successful results for five minutes,
 and is suitable for a single application process. Use a shared implementation
 of `McpIdempotencyStore` when multiple processes must coordinate. Never place
 tokens in endpoint URLs, tool arguments, logs, or traces; MCP telemetry records
 only server/tool names, outcomes, and stable error codes.
+
+## Bounded Model Tool Loops
+
+Use `run_tool_loop()` to continue normalized model responses through either an
+`AuthorizedToolExecutor` or `AuthorizedMcpToolExecutor` until the model returns
+a final response without tool calls:
+
+With an authenticated principal and either executor configured as above:
+
+```python
+from llmkit_lite.llm import ChatCompletionRequest
+from llmkit_lite.tool_loop import run_tool_loop
+
+
+async def complete(request: ChatCompletionRequest):
+    return await router.complete_response(request, http_client=client)
+
+
+result = await run_tool_loop(
+    ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Check the weather in Penang"}],
+        max_tokens=300,
+        timeout_seconds=20,
+    ),
+    complete=complete,
+    executor=authorized_executor,
+    principal=principal,
+    max_tool_rounds=4,
+)
+
+final_response = result.response
+full_transcript = result.messages
+```
+
+The runner injects the executor's exact model-visible declarations, and rejects
+conflicting request declarations before contacting a provider. Calls within a
+model response execute sequentially and pass through the executor's normal
+authorization boundary. Each assistant call message and matching tool result is
+added to the next request in order.
+
+`max_tool_rounds` bounds batches of tool execution, not the number of calls in a
+batch. When the limit is reached, the runner raises
+`tool_loop_limit_exceeded` before executing the next batch. Provider failures,
+authorization denials, tool failures, and cancellation propagate unchanged; the
+runner does not add retries. Its span records only outcomes and counts, never
+prompts, tool arguments, results, principal data, or exception messages.
 
 ## Observability
 
