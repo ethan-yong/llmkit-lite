@@ -610,6 +610,52 @@ of `McpIdempotencyStore` when multiple processes must coordinate. Never place
 tokens in endpoint URLs, tool arguments, logs, or traces; MCP telemetry records
 only server/tool names, outcomes, and stable error codes.
 
+## Bounded Model Tool Loops
+
+Use `run_tool_loop()` to continue normalized model responses through either an
+`AuthorizedToolExecutor` or `AuthorizedMcpToolExecutor` until the model returns
+a final response without tool calls:
+
+With an authenticated principal and either executor configured as above:
+
+```python
+from llmkit_lite.llm import ChatCompletionRequest
+from llmkit_lite.tool_loop import run_tool_loop
+
+
+async def complete(request: ChatCompletionRequest):
+    return await router.complete_response(request, http_client=client)
+
+
+result = await run_tool_loop(
+    ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Check the weather in Penang"}],
+        max_tokens=300,
+        timeout_seconds=20,
+    ),
+    complete=complete,
+    executor=authorized_executor,
+    principal=principal,
+    max_tool_rounds=4,
+)
+
+final_response = result.response
+full_transcript = result.messages
+```
+
+The runner injects the executor's exact model-visible declarations, and rejects
+conflicting request declarations before contacting a provider. Calls within a
+model response execute sequentially and pass through the executor's normal
+authorization boundary. Each assistant call message and matching tool result is
+added to the next request in order.
+
+`max_tool_rounds` bounds batches of tool execution, not the number of calls in a
+batch. When the limit is reached, the runner raises
+`tool_loop_limit_exceeded` before executing the next batch. Provider failures,
+authorization denials, tool failures, and cancellation propagate unchanged; the
+runner does not add retries. Its span records only outcomes and counts, never
+prompts, tool arguments, results, principal data, or exception messages.
+
 ## Observability
 
 Tracing is disabled by default. Enable OTLP/HTTP export during application
