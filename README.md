@@ -656,6 +656,88 @@ authorization denials, tool failures, and cancellation propagate unchanged; the
 runner does not add retries. Its span records only outcomes and counts, never
 prompts, tool arguments, results, principal data, or exception messages.
 
+## Admission Controls
+
+Use a weighted token bucket to limit requests or estimated tokens independently
+for each tenant and model:
+
+```python
+from llmkit_lite.admission import (
+    AdmissionKey,
+    InMemoryTokenBucketLimiter,
+    TokenBucketPolicy,
+)
+
+
+request_limits = InMemoryTokenBucketLimiter(
+    TokenBucketPolicy(
+        capacity=100,
+        refill_per_second=100 / 60,
+    )
+)
+request_key = AdmissionKey(
+    tenant_id="singtel",
+    resource="model-large",
+    limit_name="requests",
+)
+
+decision = await request_limits.acquire(request_key)
+if not decision.allowed:
+    retry_after_seconds = decision.retry_after_seconds
+```
+
+The acquisition `cost` defaults to one. A separate limiter can reserve estimated
+token units before execution by calling `acquire(token_key,
+cost=estimated_tokens)`. Requests whose cost exceeds the bucket's total capacity
+return `cost_exceeds_capacity`; they can never succeed by waiting for a refill.
+
+Concurrency leases support immediate rejection or a bounded FIFO wait. Reject
+mode is the default:
+
+```python
+from llmkit_lite.admission import (
+    ConcurrencyPolicy,
+    ConcurrencySaturationMode,
+    InMemoryConcurrencyLimiter,
+)
+
+
+concurrency = InMemoryConcurrencyLimiter(
+    ConcurrencyPolicy(
+        max_leases=20,
+        lease_ttl_seconds=30,
+        saturation_mode=ConcurrencySaturationMode.WAIT,
+        wait_timeout_seconds=2,
+        max_waiters=50,
+    )
+)
+concurrency_key = AdmissionKey(
+    tenant_id="singtel",
+    resource="model-large",
+    limit_name="concurrency",
+)
+
+acquisition = await concurrency.acquire(concurrency_key)
+if acquisition.allowed:
+    assert acquisition.lease is not None
+    try:
+        result = await call_model()
+    finally:
+        await concurrency.release(acquisition.lease)
+```
+
+Renew a lease before its expiry when a call may run longer than its configured
+lifetime. Expired leases are reclaimed, stale lease tokens cannot release a
+replacement, and waiting callers are bounded by both timeout and queue size.
+
+`InMemoryTokenBucketLimiter` and `InMemoryConcurrencyLimiter` are concurrency
+safe only inside one Python process. They are reference implementations for
+tests and local development, not distributed controls for multiple workers or
+Kubernetes pods. Production deployments must provide protocol-compatible
+implementations backed by an atomic shared store. Admission spans contain only
+policies, numeric capacity data, and stable outcomes; tenant IDs, resources,
+limit names, and lease tokens are excluded.
+
 ## Observability
 
 Tracing is disabled by default. Enable OTLP/HTTP export during application
