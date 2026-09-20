@@ -738,6 +738,81 @@ implementations backed by an atomic shared store. Admission spans contain only
 policies, numeric capacity data, and stable outcomes; tenant IDs, resources,
 limit names, and lease tokens are excluded.
 
+### Token and cost budgets
+
+Configure model prices explicitly; the kit does not ship vendor rates or convert
+currencies. The application supplies the tenant's token and cost period IDs
+(for example, a UTC day and month) and updates them when each period changes:
+
+```python
+from decimal import Decimal
+
+from llmkit_lite.budgets import (
+    BudgetKey,
+    BudgetPolicy,
+    InMemoryBudgetLedger,
+    ModelPrice,
+    ModelPriceTable,
+)
+
+
+budgets = InMemoryBudgetLedger(
+    BudgetPolicy(
+        token_limit=1_000_000,
+        cost_limit=Decimal("2000.00"),
+        currency="MYR",
+    ),
+    ModelPriceTable(
+        (
+            ModelPrice(
+                provider="vllm",
+                model="model-large",
+                input_per_million=Decimal("2.50"),
+                output_per_million=Decimal("7.50"),
+                currency="MYR",
+            ),
+        )
+    ),
+)
+key = BudgetKey(
+    tenant_id="singtel",
+    token_period_id="2026-09-20",
+    cost_period_id="2026-09",
+)
+decision = await budgets.reserve(
+    key,
+    provider="vllm",
+    model="model-large",
+    estimated_input_tokens=8_000,
+    max_output_tokens=2_000,
+)
+if decision.allowed:
+    assert decision.reservation is not None
+    reservation = decision.reservation
+    await budgets.mark_attempted(reservation)
+    try:
+        response = await call_provider()
+    except BaseException:
+        await budgets.reconcile(reservation, None)
+        raise
+    else:
+        settlement = await budgets.reconcile(reservation, response.usage)
+```
+
+If the provider was never called, use `cancel(reservation)` to refund both
+reservations; cancellation is forbidden after `mark_attempted()`. Missing usage
+conservatively charges the reserved amounts. Actual usage may exceed the
+estimate: reconciliation records the full charge, and subsequent reservations
+are denied until the quota permits them. Reservations always settle against
+their original period IDs, even after the application moves to a new period.
+
+`InMemoryBudgetLedger` is also process-local and intended for tests or local
+development. Multi-worker deployments need a shared atomic `BudgetLedger`
+implementation. The ledger does not yet integrate with router retries or
+fallbacks; each provider attempt will need its own reservation. Budget spans
+contain outcomes and token counts, not tenant/model/period identifiers, prices,
+or exception messages.
+
 ## Observability
 
 Tracing is disabled by default. Enable OTLP/HTTP export during application
