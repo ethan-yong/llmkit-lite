@@ -1,17 +1,37 @@
 import asyncio
+from decimal import Decimal
 
 import httpx
 import pytest
 
+from llmkit_lite.admission import (
+    AdmissionKey,
+    ConcurrencyDecision,
+    ConcurrencyLease,
+    ConcurrencyOutcome,
+    RateLimitDecision,
+    RateLimitOutcome,
+)
+from llmkit_lite.budgets import (
+    BudgetDecision,
+    BudgetKey,
+    BudgetOutcome,
+    BudgetReservation,
+    BudgetSettlement,
+)
 from llmkit_lite.llm import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     LlmCapabilities,
     LlmEndpointConfig,
     LlmGatewayError,
+    TokenUsage,
     ToolCall,
 )
 from llmkit_lite.routing import (
+    LlmAdmissionContext,
+    LlmAdmissionControls,
+    LlmAdmissionError,
     LlmResiliencePolicy,
     LlmRoute,
     LlmRouter,
@@ -96,6 +116,173 @@ class BlockingProbeAdapter(RecordingAdapter):
         self.started.set()
         await self.release.wait()
         return _response(self.result, cfg.provider)
+
+
+class RecordingRateLimiter:
+    def __init__(
+        self,
+        decisions: list[RateLimitDecision] | None = None,
+        *,
+        label: str = "rate",
+        events: list[str] | None = None,
+    ) -> None:
+        self.decisions = list(decisions or ())
+        self.label = label
+        self.events = events
+        self.calls: list[tuple[AdmissionKey, float]] = []
+
+    async def acquire(
+        self,
+        key: AdmissionKey,
+        *,
+        cost: float = 1,
+    ) -> RateLimitDecision:
+        if self.events is not None:
+            self.events.append(self.label)
+        self.calls.append((key, cost))
+        if self.decisions:
+            return self.decisions.pop(0)
+        return RateLimitDecision(RateLimitOutcome.ALLOWED, remaining=1000)
+
+
+class RecordingConcurrencyLimiter:
+    def __init__(
+        self,
+        decisions: list[ConcurrencyDecision] | None = None,
+        *,
+        renewal_error: BaseException | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        self.decisions = list(decisions or ())
+        self.renewal_error = renewal_error
+        self.events = events
+        self.acquired: list[AdmissionKey] = []
+        self.renewed: list[ConcurrencyLease] = []
+        self.released: list[ConcurrencyLease] = []
+
+    async def acquire(self, key: AdmissionKey) -> ConcurrencyDecision:
+        if self.events is not None:
+            self.events.append("concurrency")
+        self.acquired.append(key)
+        if self.decisions:
+            return self.decisions.pop(0)
+        return ConcurrencyDecision(
+            ConcurrencyOutcome.ACQUIRED,
+            ConcurrencyLease(key, f"lease-{len(self.acquired)}", 0, 10),
+        )
+
+    async def renew(self, lease: ConcurrencyLease) -> ConcurrencyLease:
+        self.renewed.append(lease)
+        if self.renewal_error is not None:
+            raise self.renewal_error
+        renewed = ConcurrencyLease(
+            lease.key,
+            lease.token,
+            lease.acquired_at,
+            lease.expires_at + 10,
+        )
+        await asyncio.sleep(0)
+        return renewed
+
+    async def release(self, lease: ConcurrencyLease) -> None:
+        self.released.append(lease)
+
+
+class RecordingBudgetLedger:
+    def __init__(
+        self,
+        decisions: list[BudgetDecision] | None = None,
+        *,
+        events: list[str] | None = None,
+        reconcile_error: BaseException | None = None,
+        cancel_error: BaseException | None = None,
+    ) -> None:
+        self.decisions = list(decisions or ())
+        self.events = events
+        self.reconcile_error = reconcile_error
+        self.cancel_error = cancel_error
+        self.reserve_calls: list[tuple[BudgetKey, str, str, int, int]] = []
+        self.marked: list[BudgetReservation] = []
+        self.reconciled: list[tuple[BudgetReservation, TokenUsage | None]] = []
+        self.cancelled: list[BudgetReservation] = []
+
+    def _reservation(
+        self,
+        key: BudgetKey,
+        provider: str,
+        model: str,
+        estimated_input_tokens: int,
+        max_output_tokens: int,
+    ) -> BudgetReservation:
+        return BudgetReservation(
+            token=f"reservation-{len(self.reserve_calls)}",
+            key=key,
+            provider=provider,
+            model=model,
+            reserved_tokens=estimated_input_tokens + max_output_tokens,
+            reserved_cost=Decimal("1"),
+            _ledger_id="recording-ledger",
+        )
+
+    async def reserve(
+        self,
+        key: BudgetKey,
+        *,
+        provider: str,
+        model: str,
+        estimated_input_tokens: int,
+        max_output_tokens: int,
+    ) -> BudgetDecision:
+        if self.events is not None:
+            self.events.append("budget")
+        self.reserve_calls.append(
+            (
+                key,
+                provider,
+                model,
+                estimated_input_tokens,
+                max_output_tokens,
+            )
+        )
+        if self.decisions:
+            return self.decisions.pop(0)
+        return BudgetDecision(
+            BudgetOutcome.RESERVED,
+            self._reservation(
+                key,
+                provider,
+                model,
+                estimated_input_tokens,
+                max_output_tokens,
+            ),
+        )
+
+    async def mark_attempted(self, reservation: BudgetReservation) -> None:
+        self.marked.append(reservation)
+
+    async def reconcile(
+        self,
+        reservation: BudgetReservation,
+        usage: TokenUsage | None,
+    ) -> BudgetSettlement:
+        self.reconciled.append((reservation, usage))
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
+        return BudgetSettlement(
+            reservation,
+            charged_tokens=(
+                usage.total_tokens
+                if usage is not None
+                else reservation.reserved_tokens
+            ),
+            charged_cost=reservation.reserved_cost,
+            usage_reported=usage is not None,
+        )
+
+    async def cancel(self, reservation: BudgetReservation) -> None:
+        self.cancelled.append(reservation)
+        if self.cancel_error is not None:
+            raise self.cancel_error
 
 
 def _endpoint(
@@ -959,6 +1146,591 @@ async def test_routing_telemetry_excludes_sensitive_values(in_memory_tracing) ->
         "llm.route_fallback",
         "llm.route_attempt",
     ]
+
+
+def _admission_context() -> LlmAdmissionContext:
+    return LlmAdmissionContext(
+        tenant_id="tenant-a",
+        estimated_input_tokens=40,
+        token_period_id="2026-09-21",
+        cost_period_id="2026-09",
+    )
+
+
+def test_admission_public_values_are_validated() -> None:
+    with pytest.raises(ValueError, match="tenant ID"):
+        LlmAdmissionContext(" ", 1)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        LlmAdmissionContext("tenant", -1)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        LlmAdmissionContext("tenant", True)
+    with pytest.raises(ValueError, match="token period ID"):
+        LlmAdmissionContext("tenant", 1, token_period_id=" ")
+    with pytest.raises(ValueError, match="unsupported LLM admission"):
+        LlmAdmissionError("private-provider-error")
+    with pytest.raises(ValueError, match="retry delay"):
+        LlmAdmissionError("rate_limit_exceeded", retry_after_seconds=0)
+    with pytest.raises(TypeError, match="request rate limiter"):
+        LlmAdmissionControls(request_rate_limiter=object())  # type: ignore[arg-type]
+
+
+async def test_enabled_controls_require_context_and_budget_periods() -> None:
+    adapter = RecordingAdapter("unused")
+    rate_router = LlmRouter(
+        (LlmRoute("default", _endpoint("default"), adapter),),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            request_rate_limiter=RecordingRateLimiter()
+        ),
+    )
+    budget_router = LlmRouter(
+        (LlmRoute("default", _endpoint("default"), adapter),),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            budget_ledger=RecordingBudgetLedger()
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(TypeError, match="admission context"):
+            await rate_router.complete(_request(), http_client=client)
+        with pytest.raises(ValueError, match="period IDs"):
+            await budget_router.complete(
+                _request(),
+                http_client=client,
+                admission_context=LlmAdmissionContext("tenant", 10),
+            )
+
+    assert adapter.calls == []
+
+
+async def test_all_controls_apply_in_order_and_reconcile_actual_usage() -> None:
+    events: list[str] = []
+    usage = TokenUsage(input_tokens=30, output_tokens=12, total_tokens=42)
+
+    class UsageAdapter(RecordingAdapter):
+        async def complete(
+            self,
+            request: ChatCompletionRequest,
+            *,
+            cfg: LlmEndpointConfig,
+            http_client: httpx.AsyncClient,
+        ) -> ChatCompletionResponse:
+            self.calls.append((request, cfg, http_client))
+            events.append("provider")
+            return ChatCompletionResponse(
+                text=self.result,
+                provider=cfg.provider,
+                model=cfg.model_name,
+                usage=usage,
+            )
+
+    adapter = UsageAdapter("admitted")
+    concurrency = RecordingConcurrencyLimiter(events=events)
+    budgets = RecordingBudgetLedger(events=events)
+    request_rate = RecordingRateLimiter(
+        label="request_rate",
+        events=events,
+    )
+    token_rate = RecordingRateLimiter(label="token_rate", events=events)
+    router = LlmRouter(
+        (LlmRoute("default", _endpoint("default"), adapter),),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            request_rate_limiter=request_rate,
+            token_rate_limiter=token_rate,
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await router.complete(
+            _request(),
+            http_client=client,
+            admission_context=_admission_context(),
+        )
+
+    resource = "default:default-model"
+    assert result == "admitted"
+    assert events == [
+        "concurrency",
+        "budget",
+        "request_rate",
+        "token_rate",
+        "provider",
+    ]
+    assert concurrency.acquired == [
+        AdmissionKey("tenant-a", resource, "concurrency")
+    ]
+    assert request_rate.calls == [
+        (AdmissionKey("tenant-a", resource, "requests"), 1)
+    ]
+    assert token_rate.calls == [
+        (AdmissionKey("tenant-a", resource, "tokens"), 140)
+    ]
+    assert budgets.reserve_calls == [
+        (
+            BudgetKey("tenant-a", "2026-09-21", "2026-09"),
+            "default",
+            "default-model",
+            40,
+            100,
+        )
+    ]
+    assert budgets.marked == [budgets.reconciled[0][0]]
+    assert budgets.reconciled[0][1] == usage
+    assert budgets.cancelled == []
+    assert len(concurrency.released) == 1
+
+
+@pytest.mark.parametrize(
+    "denied_control,expected_code,expected_retry",
+    [
+        ("concurrency", "concurrency_limit_reached", 3.0),
+        ("budget", "budget_token_limit", None),
+        ("request_rate", "rate_limit_exceeded", 2.0),
+        ("token_rate", "cost_exceeds_capacity", None),
+    ],
+)
+async def test_admission_denial_stops_request_and_does_not_open_circuit(
+    denied_control: str,
+    expected_code: str,
+    expected_retry: float | None,
+) -> None:
+    concurrency_decisions = None
+    budget_decisions = None
+    request_decisions = None
+    token_decisions = None
+    if denied_control == "concurrency":
+        concurrency_decisions = [
+            ConcurrencyDecision(
+                ConcurrencyOutcome.LIMIT_REACHED,
+                retry_after_seconds=3,
+            )
+        ]
+    elif denied_control == "budget":
+        budget_decisions = [BudgetDecision(BudgetOutcome.TOKEN_LIMIT)]
+    elif denied_control == "request_rate":
+        request_decisions = [
+            RateLimitDecision(
+                RateLimitOutcome.EXCEEDED,
+                remaining=0,
+                retry_after_seconds=2,
+            )
+        ]
+    else:
+        token_decisions = [
+            RateLimitDecision(
+                RateLimitOutcome.COST_EXCEEDS_CAPACITY,
+                remaining=10,
+            )
+        ]
+
+    primary = RecordingAdapter("healthy")
+    fallback = RecordingAdapter("must not run")
+    concurrency = RecordingConcurrencyLimiter(concurrency_decisions)
+    budgets = RecordingBudgetLedger(budget_decisions)
+    request_rate = RecordingRateLimiter(request_decisions)
+    token_rate = RecordingRateLimiter(token_decisions)
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "primary",
+                _endpoint("primary"),
+                primary,
+                fallback_routes=("fallback",),
+            ),
+            LlmRoute("fallback", _endpoint("fallback"), fallback),
+        ),
+        default_route="primary",
+        resilience_policy=LlmResiliencePolicy(circuit_failure_threshold=1),
+        admission_controls=LlmAdmissionControls(
+            request_rate_limiter=request_rate,
+            token_rate_limiter=token_rate,
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmAdmissionError) as exc_info:
+            await router.complete(
+                _request(),
+                http_client=client,
+                admission_context=_admission_context(),
+            )
+
+        assert exc_info.value.code == expected_code
+        assert exc_info.value.retry_after_seconds == expected_retry
+        assert primary.calls == []
+        assert fallback.calls == []
+
+        result = await router.complete(
+            _request(),
+            http_client=client,
+            admission_context=_admission_context(),
+        )
+
+    assert result == "healthy"
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+    expected_cancelled = int(denied_control in {"request_rate", "token_rate"})
+    expected_released = int(
+        denied_control in {"budget", "request_rate", "token_rate"}
+    )
+    assert len(budgets.cancelled) == expected_cancelled
+    assert len(concurrency.released) == expected_released + 1
+
+
+async def test_retries_and_fallbacks_receive_fresh_admission() -> None:
+    primary = ScriptedAdapter(
+        [
+            LlmGatewayError("llm_timeout", "first"),
+            LlmGatewayError("llm_timeout", "second"),
+        ]
+    )
+    fallback = RecordingAdapter("recovered")
+    concurrency = RecordingConcurrencyLimiter()
+    budgets = RecordingBudgetLedger()
+    request_rate = RecordingRateLimiter()
+    token_rate = RecordingRateLimiter()
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "primary",
+                _endpoint("primary"),
+                primary,
+                fallback_routes=("fallback",),
+            ),
+            LlmRoute("fallback", _endpoint("fallback"), fallback),
+        ),
+        default_route="primary",
+        admission_controls=LlmAdmissionControls(
+            request_rate_limiter=request_rate,
+            token_rate_limiter=token_rate,
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+        _sleep=_no_sleep,
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await router.complete(
+            _request(),
+            http_client=client,
+            admission_context=_admission_context(),
+        )
+
+    assert result == "recovered"
+    assert [call[1] for call in budgets.reserve_calls] == [
+        "primary",
+        "primary",
+        "fallback",
+    ]
+    assert len(budgets.marked) == 3
+    assert [usage for _, usage in budgets.reconciled] == [None, None, None]
+    assert len(request_rate.calls) == 3
+    assert len(token_rate.calls) == 3
+    assert len(concurrency.acquired) == len(concurrency.released) == 3
+
+
+async def test_cancellation_reconciles_and_releases_attempt() -> None:
+    class BlockingAdapter(RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("unused")
+            self.started = asyncio.Event()
+
+        async def complete(
+            self,
+            request: ChatCompletionRequest,
+            *,
+            cfg: LlmEndpointConfig,
+            http_client: httpx.AsyncClient,
+        ) -> ChatCompletionResponse:
+            self.calls.append((request, cfg, http_client))
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    adapter = BlockingAdapter()
+    concurrency = RecordingConcurrencyLimiter()
+    budgets = RecordingBudgetLedger()
+    router = LlmRouter(
+        (LlmRoute("default", _endpoint("default"), adapter),),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        task = asyncio.create_task(
+            router.complete(
+                _request(),
+                http_client=client,
+                admission_context=_admission_context(),
+            )
+        )
+        await adapter.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(budgets.marked) == 1
+    assert len(budgets.reconciled) == 1
+    assert budgets.reconciled[0][1] is None
+    assert len(concurrency.released) == 1
+
+
+async def test_long_provider_call_renews_and_releases_latest_lease() -> None:
+    clock = FakeClock()
+    renewed = asyncio.Event()
+    delays: list[float] = []
+
+    class SignallingConcurrencyLimiter(RecordingConcurrencyLimiter):
+        async def renew(self, lease: ConcurrencyLease) -> ConcurrencyLease:
+            result = await super().renew(lease)
+            renewed.set()
+            return result
+
+    class WaitForRenewalAdapter(RecordingAdapter):
+        async def complete(
+            self,
+            request: ChatCompletionRequest,
+            *,
+            cfg: LlmEndpointConfig,
+            http_client: httpx.AsyncClient,
+        ) -> ChatCompletionResponse:
+            self.calls.append((request, cfg, http_client))
+            await renewed.wait()
+            return _response(self.result, cfg.provider)
+
+    async def advance_clock(delay: float) -> None:
+        delays.append(delay)
+        clock.advance(delay)
+        await asyncio.sleep(0)
+
+    concurrency = SignallingConcurrencyLimiter()
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "default",
+                _endpoint("default"),
+                WaitForRenewalAdapter("renewed"),
+            ),
+        ),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            concurrency_limiter=concurrency
+        ),
+        _clock=clock,
+        _lease_sleep=advance_clock,
+    )
+
+    async with httpx.AsyncClient() as client:
+        result = await router.complete(
+            _request(),
+            http_client=client,
+            admission_context=_admission_context(),
+        )
+
+    assert result == "renewed"
+    assert delays[0] == 5
+    assert len(concurrency.renewed) == 1
+    assert concurrency.released[0].expires_at == 20
+
+
+async def test_lease_renewal_failure_cancels_provider_and_settles_budget() -> None:
+    clock = FakeClock()
+    provider_cancelled = asyncio.Event()
+
+    class CancelledAdapter(RecordingAdapter):
+        async def complete(
+            self,
+            request: ChatCompletionRequest,
+            *,
+            cfg: LlmEndpointConfig,
+            http_client: httpx.AsyncClient,
+        ) -> ChatCompletionResponse:
+            self.calls.append((request, cfg, http_client))
+            try:
+                await asyncio.Event().wait()
+            finally:
+                provider_cancelled.set()
+            raise AssertionError("unreachable")
+
+    async def advance_clock(delay: float) -> None:
+        clock.advance(delay)
+        await asyncio.sleep(0)
+
+    concurrency = RecordingConcurrencyLimiter(
+        renewal_error=RuntimeError("private renewal failure")
+    )
+    budgets = RecordingBudgetLedger()
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "default",
+                _endpoint("default"),
+                CancelledAdapter("unused"),
+            ),
+        ),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+        _clock=clock,
+        _lease_sleep=advance_clock,
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmAdmissionError) as exc_info:
+            await router.complete(
+                _request(),
+                http_client=client,
+                admission_context=_admission_context(),
+            )
+
+    assert exc_info.value.code == "concurrency_lease_renewal_failed"
+    assert provider_cancelled.is_set()
+    assert budgets.reconciled[0][1] is None
+    assert len(concurrency.released) == 1
+
+
+async def test_cleanup_failure_is_safe_and_other_cleanup_still_runs() -> None:
+    concurrency = RecordingConcurrencyLimiter()
+    budgets = RecordingBudgetLedger(
+        reconcile_error=RuntimeError("private reconciliation failure")
+    )
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "default",
+                _endpoint("default"),
+                RecordingAdapter("completed"),
+            ),
+        ),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmAdmissionError) as exc_info:
+            await router.complete(
+                _request(),
+                http_client=client,
+                admission_context=_admission_context(),
+            )
+
+    assert exc_info.value.code == "admission_cleanup_failed"
+    assert "private" not in str(exc_info.value)
+    assert len(concurrency.released) == 1
+
+
+async def test_failed_pre_attempt_cleanup_still_releases_lease() -> None:
+    concurrency = RecordingConcurrencyLimiter()
+    budgets = RecordingBudgetLedger(
+        cancel_error=RuntimeError("private cancellation failure")
+    )
+    token_rate = RecordingRateLimiter(
+        [
+            RateLimitDecision(
+                RateLimitOutcome.COST_EXCEEDS_CAPACITY,
+                remaining=1,
+            )
+        ]
+    )
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "default",
+                _endpoint("default"),
+                RecordingAdapter("unused"),
+            ),
+        ),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            token_rate_limiter=token_rate,
+            concurrency_limiter=concurrency,
+            budget_ledger=budgets,
+        ),
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmAdmissionError) as exc_info:
+            await router.complete(
+                _request(),
+                http_client=client,
+                admission_context=_admission_context(),
+            )
+
+    assert exc_info.value.code == "admission_cleanup_failed"
+    assert len(budgets.cancelled) == 1
+    assert len(concurrency.released) == 1
+
+
+async def test_admission_telemetry_excludes_private_context(
+    in_memory_tracing,
+) -> None:
+    token_rate = RecordingRateLimiter(
+        [
+            RateLimitDecision(
+                RateLimitOutcome.EXCEEDED,
+                remaining=0,
+                retry_after_seconds=4,
+            )
+        ]
+    )
+    router = LlmRouter(
+        (
+            LlmRoute(
+                "default",
+                _endpoint("default"),
+                RecordingAdapter("must not run"),
+            ),
+        ),
+        default_route="default",
+        admission_controls=LlmAdmissionControls(
+            token_rate_limiter=token_rate
+        ),
+    )
+    context = LlmAdmissionContext(
+        "private-tenant",
+        73,
+        token_period_id="private-token-period",
+        cost_period_id="private-cost-period",
+    )
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(LlmAdmissionError):
+            await router.complete(
+                _request(secret="private-metadata"),
+                http_client=client,
+                admission_context=context,
+            )
+
+    span = next(
+        span
+        for span in in_memory_tracing.get_finished_spans()
+        if span.name == "llm.router.complete"
+    )
+    exported = str(span.attributes) + str(span.events)
+    assert "private-tenant" not in exported
+    assert "private-token-period" not in exported
+    assert "private-cost-period" not in exported
+    assert "private-metadata" not in exported
+    denial = next(
+        event for event in span.events if event.name == "llm.admission_denied"
+    )
+    assert denial.attributes["llmkit.admission.control"] == "token_rate"
+    assert denial.attributes["admission.outcome"] == "rate_limit_exceeded"
+    assert denial.attributes["admission.retry_after_seconds"] == 4
 
 
 async def _no_sleep(delay: float) -> None:

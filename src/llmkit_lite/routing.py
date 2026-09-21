@@ -13,6 +13,13 @@ from typing import Any, Literal
 
 import httpx
 
+from llmkit_lite.admission import (
+    AdmissionKey,
+    ConcurrencyLease,
+    ConcurrencyLimiter,
+    RateLimiter,
+)
+from llmkit_lite.budgets import BudgetKey, BudgetLedger, BudgetReservation
 from llmkit_lite.llm import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -20,6 +27,7 @@ from llmkit_lite.llm import (
     LlmGatewayError,
     LlmProviderAdapter,
     OpenAICompatibleAdapter,
+    TokenUsage,
     missing_capabilities,
 )
 from llmkit_lite.observability import set_span_error, trace_span
@@ -31,6 +39,18 @@ Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 Random = Callable[[], float]
 CircuitStatus = Literal["closed", "open", "half_open"]
+
+_ADMISSION_ERROR_DETAILS = {
+    "rate_limit_exceeded": "request rate limit was exceeded",
+    "cost_exceeds_capacity": "request cost exceeds rate-limit capacity",
+    "concurrency_limit_reached": "concurrency limit was reached",
+    "concurrency_queue_full": "concurrency wait queue is full",
+    "concurrency_wait_timeout": "concurrency wait timed out",
+    "budget_token_limit": "token budget was exceeded",
+    "budget_cost_limit": "cost budget was exceeded",
+    "concurrency_lease_renewal_failed": "concurrency lease renewal failed",
+    "admission_cleanup_failed": "admission cleanup failed",
+}
 
 
 def _normalized_name(value: str, field_name: str) -> str:
@@ -48,6 +68,130 @@ def _require_positive_int(value: int, field_name: str) -> None:
 def _require_non_negative(value: float, field_name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError(f"{field_name} must be non-negative")
+
+
+def _optional_normalized_name(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _normalized_name(value, field_name)
+
+
+class LlmAdmissionError(Exception):
+    """Safe admission denial that is never treated as a provider failure."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        try:
+            detail = _ADMISSION_ERROR_DETAILS[code]
+        except KeyError:
+            raise ValueError("unsupported LLM admission error code") from None
+        if retry_after_seconds is not None:
+            if (
+                isinstance(retry_after_seconds, bool)
+                or not isinstance(retry_after_seconds, (int, float))
+                or retry_after_seconds <= 0
+            ):
+                raise ValueError("admission retry delay must be greater than zero")
+            retry_after_seconds = float(retry_after_seconds)
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.retry_after_seconds = retry_after_seconds
+
+
+@dataclass(frozen=True, slots=True)
+class LlmAdmissionContext:
+    """Caller-supplied tenant identity and accounting inputs."""
+
+    tenant_id: str
+    estimated_input_tokens: int
+    token_period_id: str | None = None
+    cost_period_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "tenant_id",
+            _normalized_name(self.tenant_id, "admission tenant ID"),
+        )
+        if (
+            isinstance(self.estimated_input_tokens, bool)
+            or not isinstance(self.estimated_input_tokens, int)
+            or self.estimated_input_tokens < 0
+        ):
+            raise ValueError(
+                "estimated input tokens must be a non-negative integer"
+            )
+        object.__setattr__(
+            self,
+            "token_period_id",
+            _optional_normalized_name(
+                self.token_period_id,
+                "admission token period ID",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "cost_period_id",
+            _optional_normalized_name(
+                self.cost_period_id,
+                "admission cost period ID",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LlmAdmissionControls:
+    """Optional admission dependencies applied to each provider attempt."""
+
+    request_rate_limiter: RateLimiter | None = None
+    token_rate_limiter: RateLimiter | None = None
+    concurrency_limiter: ConcurrencyLimiter | None = None
+    budget_ledger: BudgetLedger | None = None
+
+    def __post_init__(self) -> None:
+        requirements = {
+            "request rate limiter": (self.request_rate_limiter, ("acquire",)),
+            "token rate limiter": (self.token_rate_limiter, ("acquire",)),
+            "concurrency limiter": (
+                self.concurrency_limiter,
+                ("acquire", "renew", "release"),
+            ),
+            "budget ledger": (
+                self.budget_ledger,
+                ("reserve", "mark_attempted", "reconcile", "cancel"),
+            ),
+        }
+        for field_name, (value, methods) in requirements.items():
+            if value is not None and not all(
+                callable(getattr(value, method, None)) for method in methods
+            ):
+                raise TypeError(f"{field_name} does not implement its protocol")
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether at least one admission control is configured."""
+
+        return any(
+            control is not None
+            for control in (
+                self.request_rate_limiter,
+                self.token_rate_limiter,
+                self.concurrency_limiter,
+                self.budget_ledger,
+            )
+        )
+
+
+@dataclass(slots=True)
+class _AttemptAdmission:
+    lease: ConcurrencyLease | None = None
+    reservation: BudgetReservation | None = None
+    budget_attempted: bool = False
 
 
 @dataclass(frozen=True)
@@ -217,8 +361,10 @@ class LlmRouter:
         default_route: str,
         rules: Sequence[LlmRouteRule] = (),
         resilience_policy: LlmResiliencePolicy | None = None,
+        admission_controls: LlmAdmissionControls | None = None,
         _clock: Clock = time.monotonic,
         _sleep: Sleep = asyncio.sleep,
+        _lease_sleep: Sleep = asyncio.sleep,
         _random: Random = random_module.random,
     ) -> None:
         routes_by_name: dict[str, LlmRoute] = {}
@@ -258,8 +404,17 @@ class LlmRouter:
         self._default_route = normalized_default
         self._rules = normalized_rules
         self._policy = resilience_policy or LlmResiliencePolicy()
+        if admission_controls is not None and not isinstance(
+            admission_controls,
+            LlmAdmissionControls,
+        ):
+            raise TypeError("admission controls must be LlmAdmissionControls or None")
+        if not callable(_lease_sleep):
+            raise TypeError("lease sleep must be callable")
+        self._admission_controls = admission_controls
         self._clock = _clock
         self._sleep = _sleep
+        self._lease_sleep = _lease_sleep
         self._random = _random
         self._circuits = {name: _CircuitBreaker() for name in routes_by_name}
 
@@ -287,6 +442,307 @@ class LlmRouter:
         jitter = 1 + self._policy.jitter_ratio * (2 * random_value - 1)
         return min(self._policy.max_backoff_seconds, nominal * jitter)
 
+    def _validate_admission_context(
+        self,
+        context: LlmAdmissionContext | None,
+    ) -> None:
+        controls = self._admission_controls
+        if controls is None or not controls.enabled:
+            return
+        if not isinstance(context, LlmAdmissionContext):
+            raise TypeError(
+                "admission context must be supplied when controls are enabled"
+            )
+        if controls.budget_ledger is not None and (
+            context.token_period_id is None or context.cost_period_id is None
+        ):
+            raise ValueError(
+                "token and cost period IDs are required when budgets are enabled"
+            )
+
+    def _admission_error(
+        self,
+        *,
+        control: str,
+        code: str,
+        retry_after_seconds: float | None,
+        span: Any,
+    ) -> LlmAdmissionError:
+        error = LlmAdmissionError(
+            code,
+            retry_after_seconds=retry_after_seconds,
+        )
+        attributes: dict[str, str | float] = {
+            "llmkit.admission.control": control,
+            "admission.outcome": code,
+            "error.type": code,
+        }
+        if retry_after_seconds is not None:
+            attributes["admission.retry_after_seconds"] = retry_after_seconds
+        _add_event(span, "llm.admission_denied", attributes)
+        if span is not None:
+            span.set_attribute("error.type", code)
+            set_span_error(span, code)
+        return error
+
+    async def _cleanup_admission(
+        self,
+        state: _AttemptAdmission,
+        *,
+        usage: TokenUsage | None,
+        span: Any,
+    ) -> None:
+        controls = self._admission_controls
+        assert controls is not None
+        failures: list[BaseException] = []
+
+        if state.reservation is not None:
+            try:
+                if state.budget_attempted:
+                    assert controls.budget_ledger is not None
+                    await controls.budget_ledger.reconcile(state.reservation, usage)
+                else:
+                    assert controls.budget_ledger is not None
+                    await controls.budget_ledger.cancel(state.reservation)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                state.reservation = None
+
+        if state.lease is not None:
+            try:
+                assert controls.concurrency_limiter is not None
+                await controls.concurrency_limiter.release(state.lease)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                state.lease = None
+
+        if failures:
+            error = self._admission_error(
+                control="cleanup",
+                code="admission_cleanup_failed",
+                retry_after_seconds=None,
+                span=span,
+            )
+            raise error from failures[0]
+
+    async def _admit_attempt(
+        self,
+        route: LlmRoute,
+        request: ChatCompletionRequest,
+        context: LlmAdmissionContext,
+        *,
+        span: Any,
+    ) -> _AttemptAdmission:
+        controls = self._admission_controls
+        assert controls is not None and controls.enabled
+        state = _AttemptAdmission()
+        resource = f"{route.endpoint.provider}:{route.endpoint.model_name}"
+        estimated_tokens = context.estimated_input_tokens + request.max_tokens
+
+        try:
+            if controls.concurrency_limiter is not None:
+                decision = await controls.concurrency_limiter.acquire(
+                    AdmissionKey(context.tenant_id, resource, "concurrency")
+                )
+                if not decision.allowed:
+                    raise self._admission_error(
+                        control="concurrency",
+                        code=decision.outcome.value,
+                        retry_after_seconds=decision.retry_after_seconds,
+                        span=span,
+                    )
+                assert decision.lease is not None
+                state.lease = decision.lease
+
+            if controls.budget_ledger is not None:
+                assert context.token_period_id is not None
+                assert context.cost_period_id is not None
+                decision = await controls.budget_ledger.reserve(
+                    BudgetKey(
+                        context.tenant_id,
+                        context.token_period_id,
+                        context.cost_period_id,
+                    ),
+                    provider=route.endpoint.provider,
+                    model=route.endpoint.model_name,
+                    estimated_input_tokens=context.estimated_input_tokens,
+                    max_output_tokens=request.max_tokens,
+                )
+                if not decision.allowed:
+                    raise self._admission_error(
+                        control="budget",
+                        code=decision.outcome.value,
+                        retry_after_seconds=None,
+                        span=span,
+                    )
+                assert decision.reservation is not None
+                state.reservation = decision.reservation
+
+            if controls.request_rate_limiter is not None:
+                decision = await controls.request_rate_limiter.acquire(
+                    AdmissionKey(context.tenant_id, resource, "requests")
+                )
+                if not decision.allowed:
+                    raise self._admission_error(
+                        control="request_rate",
+                        code=decision.outcome.value,
+                        retry_after_seconds=decision.retry_after_seconds,
+                        span=span,
+                    )
+
+            if controls.token_rate_limiter is not None:
+                decision = await controls.token_rate_limiter.acquire(
+                    AdmissionKey(context.tenant_id, resource, "tokens"),
+                    cost=estimated_tokens,
+                )
+                if not decision.allowed:
+                    raise self._admission_error(
+                        control="token_rate",
+                        code=decision.outcome.value,
+                        retry_after_seconds=decision.retry_after_seconds,
+                        span=span,
+                    )
+        except BaseException as exc:
+            try:
+                await self._cleanup_admission(state, usage=None, span=span)
+            except LlmAdmissionError as cleanup_error:
+                raise cleanup_error from exc
+            raise
+
+        _add_event(
+            span,
+            "llm.admission_allowed",
+            {
+                "admission.outcome": "allowed",
+                "admission.estimated_tokens": estimated_tokens,
+            },
+        )
+        return state
+
+    async def _renew_lease_until_complete(
+        self,
+        state: _AttemptAdmission,
+        provider_task: asyncio.Task[ChatCompletionResponse],
+    ) -> None:
+        controls = self._admission_controls
+        assert controls is not None
+        assert controls.concurrency_limiter is not None
+
+        while not provider_task.done():
+            assert state.lease is not None
+            remaining = state.lease.expires_at - self._clock()
+            await self._lease_sleep(max(0.0, remaining / 2))
+            if provider_task.done():
+                return
+            state.lease = await controls.concurrency_limiter.renew(state.lease)
+
+    async def _invoke_provider(
+        self,
+        route: LlmRoute,
+        request: ChatCompletionRequest,
+        *,
+        http_client: httpx.AsyncClient,
+        state: _AttemptAdmission,
+        span: Any,
+    ) -> ChatCompletionResponse:
+        provider_task = asyncio.create_task(
+            route.adapter.complete(
+                request,
+                cfg=route.endpoint,
+                http_client=http_client,
+            )
+        )
+        renewal_task: asyncio.Task[None] | None = None
+        if state.lease is not None:
+            renewal_task = asyncio.create_task(
+                self._renew_lease_until_complete(state, provider_task)
+            )
+
+        try:
+            if renewal_task is None:
+                return await provider_task
+
+            await asyncio.wait(
+                (provider_task, renewal_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if renewal_task.done():
+                renewal_error = renewal_task.exception()
+                if renewal_error is not None:
+                    provider_task.cancel()
+                    await asyncio.gather(provider_task, return_exceptions=True)
+                    error = self._admission_error(
+                        control="concurrency",
+                        code="concurrency_lease_renewal_failed",
+                        retry_after_seconds=None,
+                        span=span,
+                    )
+                    raise error from renewal_error
+            return await provider_task
+        finally:
+            for task in (provider_task, renewal_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending = tuple(
+                task
+                for task in (provider_task, renewal_task)
+                if task is not None
+            )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _complete_attempt(
+        self,
+        route: LlmRoute,
+        request: ChatCompletionRequest,
+        *,
+        http_client: httpx.AsyncClient,
+        span: Any,
+        admission_context: LlmAdmissionContext | None,
+    ) -> ChatCompletionResponse:
+        controls = self._admission_controls
+        if controls is None or not controls.enabled:
+            return await route.adapter.complete(
+                request,
+                cfg=route.endpoint,
+                http_client=http_client,
+            )
+
+        assert admission_context is not None
+        state = await self._admit_attempt(
+            route,
+            request,
+            admission_context,
+            span=span,
+        )
+        try:
+            if state.reservation is not None:
+                assert controls.budget_ledger is not None
+                await controls.budget_ledger.mark_attempted(state.reservation)
+                state.budget_attempted = True
+            response = await self._invoke_provider(
+                route,
+                request,
+                http_client=http_client,
+                state=state,
+                span=span,
+            )
+            if not isinstance(response, ChatCompletionResponse):
+                raise TypeError(
+                    "LLM provider adapters must return ChatCompletionResponse"
+                )
+        except BaseException as exc:
+            try:
+                await self._cleanup_admission(state, usage=None, span=span)
+            except LlmAdmissionError as cleanup_error:
+                raise cleanup_error from exc
+            raise
+
+        await self._cleanup_admission(state, usage=response.usage, span=span)
+        return response
+
     async def _complete_route(
         self,
         route: LlmRoute,
@@ -294,6 +750,7 @@ class LlmRouter:
         *,
         http_client: httpx.AsyncClient,
         span: Any,
+        admission_context: LlmAdmissionContext | None,
     ) -> ChatCompletionResponse:
         for attempt in range(1, self._policy.max_attempts_per_route + 1):
             _add_event(
@@ -302,10 +759,12 @@ class LlmRouter:
                 _route_attributes(route, attempt=attempt),
             )
             try:
-                response = await route.adapter.complete(
+                response = await self._complete_attempt(
+                    route,
                     request,
-                    cfg=route.endpoint,
                     http_client=http_client,
+                    span=span,
+                    admission_context=admission_context,
                 )
                 if not isinstance(response, ChatCompletionResponse):
                     raise TypeError(
@@ -348,9 +807,11 @@ class LlmRouter:
         request: ChatCompletionRequest,
         *,
         http_client: httpx.AsyncClient,
+        admission_context: LlmAdmissionContext | None = None,
     ) -> ChatCompletionResponse:
         """Resolve a route and return its normalized provider response."""
 
+        self._validate_admission_context(admission_context)
         primary = self.resolve(request)
         candidate_names = (primary.name, *primary.fallback_routes)
         attributes: dict[str, str | int] = {
@@ -429,6 +890,7 @@ class LlmRouter:
                         request,
                         http_client=http_client,
                         span=span,
+                        admission_context=admission_context,
                     )
                 except LlmGatewayError as exc:
                     last_error = exc
@@ -494,10 +956,15 @@ class LlmRouter:
         request: ChatCompletionRequest,
         *,
         http_client: httpx.AsyncClient,
+        admission_context: LlmAdmissionContext | None = None,
     ) -> str:
         """Resolve a route and return text for compatibility-oriented callers."""
 
-        response = await self.complete_response(request, http_client=http_client)
+        response = await self.complete_response(
+            request,
+            http_client=http_client,
+            admission_context=admission_context,
+        )
         if response.text is None:
             raise LlmGatewayError(
                 "llm_text_response_required",

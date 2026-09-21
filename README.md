@@ -656,6 +656,170 @@ authorization denials, tool failures, and cancellation propagate unchanged; the
 runner does not add retries. Its span records only outcomes and counts, never
 prompts, tool arguments, results, principal data, or exception messages.
 
+## Admission Controls
+
+Use a weighted token bucket to limit requests or estimated tokens independently
+for each tenant and model:
+
+```python
+from llmkit_lite.admission import (
+    AdmissionKey,
+    InMemoryTokenBucketLimiter,
+    TokenBucketPolicy,
+)
+
+
+request_limits = InMemoryTokenBucketLimiter(
+    TokenBucketPolicy(
+        capacity=100,
+        refill_per_second=100 / 60,
+    )
+)
+request_key = AdmissionKey(
+    tenant_id="singtel",
+    resource="model-large",
+    limit_name="requests",
+)
+
+decision = await request_limits.acquire(request_key)
+if not decision.allowed:
+    retry_after_seconds = decision.retry_after_seconds
+```
+
+The acquisition `cost` defaults to one. A separate limiter can reserve estimated
+token units before execution by calling `acquire(token_key,
+cost=estimated_tokens)`. Requests whose cost exceeds the bucket's total capacity
+return `cost_exceeds_capacity`; they can never succeed by waiting for a refill.
+
+Concurrency leases support immediate rejection or a bounded FIFO wait. Reject
+mode is the default:
+
+```python
+from llmkit_lite.admission import (
+    ConcurrencyPolicy,
+    ConcurrencySaturationMode,
+    InMemoryConcurrencyLimiter,
+)
+
+
+concurrency = InMemoryConcurrencyLimiter(
+    ConcurrencyPolicy(
+        max_leases=20,
+        lease_ttl_seconds=30,
+        saturation_mode=ConcurrencySaturationMode.WAIT,
+        wait_timeout_seconds=2,
+        max_waiters=50,
+    )
+)
+concurrency_key = AdmissionKey(
+    tenant_id="singtel",
+    resource="model-large",
+    limit_name="concurrency",
+)
+
+acquisition = await concurrency.acquire(concurrency_key)
+if acquisition.allowed:
+    assert acquisition.lease is not None
+    try:
+        result = await call_model()
+    finally:
+        await concurrency.release(acquisition.lease)
+```
+
+Renew a lease before its expiry when a call may run longer than its configured
+lifetime. Expired leases are reclaimed, stale lease tokens cannot release a
+replacement, and waiting callers are bounded by both timeout and queue size.
+
+`InMemoryTokenBucketLimiter` and `InMemoryConcurrencyLimiter` are concurrency
+safe only inside one Python process. They are reference implementations for
+tests and local development, not distributed controls for multiple workers or
+Kubernetes pods. Production deployments must provide protocol-compatible
+implementations backed by an atomic shared store. Admission spans contain only
+policies, numeric capacity data, and stable outcomes; tenant IDs, resources,
+limit names, and lease tokens are excluded.
+
+### Token and cost budgets
+
+Configure model prices explicitly; the kit does not ship vendor rates or convert
+currencies. The application supplies the tenant's token and cost period IDs
+(for example, a UTC day and month) and updates them when each period changes:
+
+```python
+from decimal import Decimal
+
+from llmkit_lite.budgets import (
+    BudgetPolicy,
+    InMemoryBudgetLedger,
+    ModelPrice,
+    ModelPriceTable,
+)
+
+
+budgets = InMemoryBudgetLedger(
+    BudgetPolicy(
+        token_limit=1_000_000,
+        cost_limit=Decimal("2000.00"),
+        currency="MYR",
+    ),
+    ModelPriceTable(
+        (
+            ModelPrice(
+                provider="vllm",
+                model="model-large",
+                input_per_million=Decimal("2.50"),
+                output_per_million=Decimal("7.50"),
+                currency="MYR",
+            ),
+        )
+    ),
+)
+from llmkit_lite.routing import (
+    LlmAdmissionContext,
+    LlmAdmissionControls,
+    LlmRouter,
+)
+
+
+router = LlmRouter(
+    routes,
+    default_route="local",
+    admission_controls=LlmAdmissionControls(
+        request_rate_limiter=request_limits,
+        concurrency_limiter=concurrency,
+        budget_ledger=budgets,
+    ),
+)
+response = await router.complete_response(
+    request,
+    http_client=client,
+    admission_context=LlmAdmissionContext(
+        tenant_id="singtel",
+        estimated_input_tokens=8_000,
+        token_period_id="2026-09-20",
+        cost_period_id="2026-09",
+    ),
+)
+```
+
+The router acquires concurrency, reserves the budget, and consumes configured
+request and token rate limits before every provider attempt. Provider retries
+and fallbacks receive fresh admission. An admission denial raises
+`LlmAdmissionError` without retrying, falling back, or affecting the provider's
+circuit breaker. Request-rate capacity is not refunded when a later token-rate
+check denies the same attempt because token-bucket acquisitions are consumptive.
+
+The caller supplies the input-token estimate; the router adds `request.max_tokens`
+for token-rate and budget admission. Missing provider usage conservatively
+charges the reserved amounts. Actual usage may exceed the estimate, and every
+reservation remains attached to its original period IDs. Concurrency leases are
+renewed halfway to expiry while a provider call is still running.
+
+`InMemoryBudgetLedger` is also process-local and intended for tests or local
+development. Multi-worker deployments need a shared atomic `BudgetLedger`
+implementation. Budget and admission spans contain outcomes and numeric counts,
+not tenant/period identifiers, reservation tokens, prices, or exception
+messages.
+
 ## Observability
 
 Tracing is disabled by default. Enable OTLP/HTTP export during application
