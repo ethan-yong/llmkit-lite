@@ -748,7 +748,6 @@ currencies. The application supplies the tenant's token and cost period IDs
 from decimal import Decimal
 
 from llmkit_lite.budgets import (
-    BudgetKey,
     BudgetPolicy,
     InMemoryBudgetLedger,
     ModelPrice,
@@ -774,44 +773,52 @@ budgets = InMemoryBudgetLedger(
         )
     ),
 )
-key = BudgetKey(
-    tenant_id="singtel",
-    token_period_id="2026-09-20",
-    cost_period_id="2026-09",
+from llmkit_lite.routing import (
+    LlmAdmissionContext,
+    LlmAdmissionControls,
+    LlmRouter,
 )
-decision = await budgets.reserve(
-    key,
-    provider="vllm",
-    model="model-large",
-    estimated_input_tokens=8_000,
-    max_output_tokens=2_000,
+
+
+router = LlmRouter(
+    routes,
+    default_route="local",
+    admission_controls=LlmAdmissionControls(
+        request_rate_limiter=request_limits,
+        concurrency_limiter=concurrency,
+        budget_ledger=budgets,
+    ),
 )
-if decision.allowed:
-    assert decision.reservation is not None
-    reservation = decision.reservation
-    await budgets.mark_attempted(reservation)
-    try:
-        response = await call_provider()
-    except BaseException:
-        await budgets.reconcile(reservation, None)
-        raise
-    else:
-        settlement = await budgets.reconcile(reservation, response.usage)
+response = await router.complete_response(
+    request,
+    http_client=client,
+    admission_context=LlmAdmissionContext(
+        tenant_id="singtel",
+        estimated_input_tokens=8_000,
+        token_period_id="2026-09-20",
+        cost_period_id="2026-09",
+    ),
+)
 ```
 
-If the provider was never called, use `cancel(reservation)` to refund both
-reservations; cancellation is forbidden after `mark_attempted()`. Missing usage
-conservatively charges the reserved amounts. Actual usage may exceed the
-estimate: reconciliation records the full charge, and subsequent reservations
-are denied until the quota permits them. Reservations always settle against
-their original period IDs, even after the application moves to a new period.
+The router acquires concurrency, reserves the budget, and consumes configured
+request and token rate limits before every provider attempt. Provider retries
+and fallbacks receive fresh admission. An admission denial raises
+`LlmAdmissionError` without retrying, falling back, or affecting the provider's
+circuit breaker. Request-rate capacity is not refunded when a later token-rate
+check denies the same attempt because token-bucket acquisitions are consumptive.
+
+The caller supplies the input-token estimate; the router adds `request.max_tokens`
+for token-rate and budget admission. Missing provider usage conservatively
+charges the reserved amounts. Actual usage may exceed the estimate, and every
+reservation remains attached to its original period IDs. Concurrency leases are
+renewed halfway to expiry while a provider call is still running.
 
 `InMemoryBudgetLedger` is also process-local and intended for tests or local
 development. Multi-worker deployments need a shared atomic `BudgetLedger`
-implementation. The ledger does not yet integrate with router retries or
-fallbacks; each provider attempt will need its own reservation. Budget spans
-contain outcomes and token counts, not tenant/model/period identifiers, prices,
-or exception messages.
+implementation. Budget and admission spans contain outcomes and numeric counts,
+not tenant/period identifiers, reservation tokens, prices, or exception
+messages.
 
 ## Observability
 
